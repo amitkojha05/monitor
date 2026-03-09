@@ -26,6 +26,10 @@ import {
   StoredCommandLogEntry,
   CommandLogQueryOptions,
   CommandLogType,
+  StoredLatencySnapshot,
+  LatencySnapshotQueryOptions,
+  StoredMemorySnapshot,
+  MemorySnapshotQueryOptions,
 } from '../../common/interfaces/storage-port.interface';
 
 export class MemoryAdapter implements StoragePort {
@@ -35,6 +39,9 @@ export class MemoryAdapter implements StoragePort {
   private correlatedGroups: StoredCorrelatedGroup[] = [];
   private slowLogEntries: StoredSlowLogEntry[] = [];
   private commandLogEntries: StoredCommandLogEntry[] = [];
+  private latencySnapshots: StoredLatencySnapshot[] = [];
+  private latencyHistograms: import('../../common/interfaces/storage-port.interface').StoredLatencyHistogram[] = [];
+  private memorySnapshots: StoredMemorySnapshot[] = [];
   private settings: AppSettings | null = null;
   private webhooks: Map<string, Webhook> = new Map();
   private deliveries: Map<string, WebhookDelivery> = new Map();
@@ -918,6 +925,102 @@ export class MemoryAdapter implements StoragePort {
       this.commandLogEntries = this.commandLogEntries.filter(e => e.capturedAt >= cutoffTimestamp);
     }
     return before - this.commandLogEntries.length;
+  }
+
+  // Latency Snapshot Methods
+  async saveLatencySnapshots(snapshots: StoredLatencySnapshot[], connectionId: string): Promise<number> {
+    for (const snapshot of snapshots) {
+      this.latencySnapshots.push({ ...snapshot, connectionId });
+    }
+    return snapshots.length;
+  }
+
+  async getLatencySnapshots(options: LatencySnapshotQueryOptions = {}): Promise<StoredLatencySnapshot[]> {
+    let filtered = [...this.latencySnapshots];
+
+    if (options.connectionId) {
+      filtered = filtered.filter(e => e.connectionId === options.connectionId);
+    }
+    if (options.startTime) {
+      filtered = filtered.filter(e => e.timestamp >= options.startTime!);
+    }
+    if (options.endTime) {
+      filtered = filtered.filter(e => e.timestamp <= options.endTime!);
+    }
+
+    return filtered
+      .sort((a, b) => b.timestamp - a.timestamp)
+      .slice(options.offset ?? 0, (options.offset ?? 0) + (options.limit ?? 100));
+  }
+
+  async pruneOldLatencySnapshots(cutoffTimestamp: number, connectionId?: string): Promise<number> {
+    const before = this.latencySnapshots.length;
+    if (connectionId) {
+      this.latencySnapshots = this.latencySnapshots.filter(e => e.timestamp >= cutoffTimestamp || e.connectionId !== connectionId);
+    } else {
+      this.latencySnapshots = this.latencySnapshots.filter(e => e.timestamp >= cutoffTimestamp);
+    }
+    return before - this.latencySnapshots.length;
+  }
+
+  // Latency Histogram Methods
+  async saveLatencyHistogram(histogram: import('../../common/interfaces/storage-port.interface').StoredLatencyHistogram, connectionId: string): Promise<number> {
+    this.latencyHistograms.push({ ...histogram, connectionId });
+    return 1;
+  }
+
+  async getLatencyHistograms(options: { connectionId?: string; startTime?: number; endTime?: number; limit?: number } = {}): Promise<import('../../common/interfaces/storage-port.interface').StoredLatencyHistogram[]> {
+    let filtered = [...this.latencyHistograms];
+    if (options.connectionId) filtered = filtered.filter(e => e.connectionId === options.connectionId);
+    if (options.startTime) filtered = filtered.filter(e => e.timestamp >= options.startTime!);
+    if (options.endTime) filtered = filtered.filter(e => e.timestamp <= options.endTime!);
+    return filtered.sort((a, b) => b.timestamp - a.timestamp).slice(0, options.limit ?? 1);
+  }
+
+  async pruneOldLatencyHistograms(cutoffTimestamp: number, connectionId?: string): Promise<number> {
+    const before = this.latencyHistograms.length;
+    if (connectionId) {
+      this.latencyHistograms = this.latencyHistograms.filter(e => e.timestamp >= cutoffTimestamp || e.connectionId !== connectionId);
+    } else {
+      this.latencyHistograms = this.latencyHistograms.filter(e => e.timestamp >= cutoffTimestamp);
+    }
+    return before - this.latencyHistograms.length;
+  }
+
+  // Memory Snapshot Methods
+  async saveMemorySnapshots(snapshots: StoredMemorySnapshot[], connectionId: string): Promise<number> {
+    for (const snapshot of snapshots) {
+      this.memorySnapshots.push({ ...snapshot, connectionId });
+    }
+    return snapshots.length;
+  }
+
+  async getMemorySnapshots(options: MemorySnapshotQueryOptions = {}): Promise<StoredMemorySnapshot[]> {
+    let filtered = [...this.memorySnapshots];
+
+    if (options.connectionId) {
+      filtered = filtered.filter(e => e.connectionId === options.connectionId);
+    }
+    if (options.startTime) {
+      filtered = filtered.filter(e => e.timestamp >= options.startTime!);
+    }
+    if (options.endTime) {
+      filtered = filtered.filter(e => e.timestamp <= options.endTime!);
+    }
+
+    return filtered
+      .sort((a, b) => b.timestamp - a.timestamp)
+      .slice(options.offset ?? 0, (options.offset ?? 0) + (options.limit ?? 100));
+  }
+
+  async pruneOldMemorySnapshots(cutoffTimestamp: number, connectionId?: string): Promise<number> {
+    const before = this.memorySnapshots.length;
+    if (connectionId) {
+      this.memorySnapshots = this.memorySnapshots.filter(e => e.timestamp >= cutoffTimestamp || e.connectionId !== connectionId);
+    } else {
+      this.memorySnapshots = this.memorySnapshots.filter(e => e.timestamp >= cutoffTimestamp);
+    }
+    return before - this.memorySnapshots.length;
   }
 
   // Connection Management Methods (in-memory storage)

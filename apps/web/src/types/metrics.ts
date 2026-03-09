@@ -122,6 +122,13 @@ export interface LatencyHistogram {
   histogram: { [bucket: string]: number };
 }
 
+export interface StoredLatencyHistogram {
+  id: string;
+  timestamp: number;
+  data: Record<string, LatencyHistogram>;
+  connectionId?: string;
+}
+
 export interface MemoryStats {
   peakAllocated: number;
   totalAllocated: number;
@@ -130,6 +137,30 @@ export interface MemoryStats {
   peakPercentage: number;
   fragmentation: number;
   fragmentationBytes: number;
+}
+
+export interface StoredLatencySnapshot {
+  id: string;
+  timestamp: number;
+  eventName: string;
+  latestEventTimestamp: number;
+  maxLatency: number;
+  connectionId?: string;
+}
+
+export interface StoredMemorySnapshot {
+  id: string;
+  timestamp: number;
+  usedMemory: number;
+  usedMemoryRss: number;
+  usedMemoryPeak: number;
+  memFragmentationRatio: number;
+  maxmemory: number;
+  allocatorFragRatio: number;
+  opsPerSec: number;
+  cpuSys: number;
+  cpuUser: number;
+  connectionId?: string;
 }
 
 export interface ClientInfo {

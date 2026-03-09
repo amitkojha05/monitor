@@ -6,7 +6,8 @@ import { Card, CardHeader, CardTitle, CardContent } from '../components/ui/card'
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '../components/ui/table';
 import { LineChart, Line, BarChart, Bar, AreaChart, Area, XAxis, YAxis, Tooltip, ResponsiveContainer, CartesianGrid, Legend } from 'recharts';
 import { DoctorCard } from '../components/DoctorCard';
-import type { LatencyHistoryEntry } from '../types/metrics';
+import { DateRangePicker, DateRange } from '../components/ui/date-range-picker';
+import type { LatencyHistoryEntry, LatencyEvent, LatencyHistogram, StoredLatencySnapshot } from '../types/metrics';
 
 const EVENTS_POLL_INTERVAL_MS = 10_000;
 const HISTOGRAM_POLL_INTERVAL_MS = 30_000;
@@ -37,17 +38,76 @@ export function Latency() {
   const [doctorReport, setDoctorReport] = useState<string>();
   const [doctorLoading, setDoctorLoading] = useState(true);
 
-  const { data: latencyEvents } = usePolling({
+  // Time filter state
+  const [dateRange, setDateRange] = useState<DateRange | undefined>(undefined);
+
+  const startTime = dateRange?.from
+    ? dateRange.from.getTime()
+    : undefined;
+  const endTime = dateRange?.to
+    ? dateRange.to.getTime()
+    : undefined;
+
+  const isTimeFiltered = startTime !== undefined && endTime !== undefined;
+
+  // Live polling (disabled when filtering)
+  const { data: liveLatencyEvents } = usePolling({
     fetcher: metricsApi.getLatencyLatest,
     interval: EVENTS_POLL_INTERVAL_MS,
+    enabled: !isTimeFiltered,
     refetchKey: currentConnection?.id,
   });
 
-  const { data: histogramData } = usePolling({
+  const { data: liveHistogramData } = usePolling({
     fetcher: () => metricsApi.getLatencyHistogram(),
     interval: HISTOGRAM_POLL_INTERVAL_MS,
+    enabled: !isTimeFiltered,
     refetchKey: currentConnection?.id,
   });
+
+  // Stored data (with time filter)
+  const [storedSnapshots, setStoredSnapshots] = useState<StoredLatencySnapshot[] | null>(null);
+  const [storedHistogramData, setStoredHistogramData] = useState<Record<string, LatencyHistogram> | null>(null);
+
+  useEffect(() => {
+    if (!isTimeFiltered) {
+      setStoredSnapshots(null);
+      setStoredHistogramData(null);
+      return;
+    }
+
+    setStoredSnapshots(null);
+    setStoredHistogramData(null);
+    let cancelled = false;
+
+    Promise.all([
+      metricsApi.getStoredLatencySnapshots({ startTime, endTime, limit: 500 }),
+      metricsApi.getStoredLatencyHistograms({ startTime, endTime, limit: 1 }),
+    ]).then(([snapshots, histograms]) => {
+      if (cancelled) return;
+      setStoredSnapshots(snapshots);
+      setStoredHistogramData(histograms.length > 0 ? histograms[0].data : null);
+    }).catch(err => {
+      console.error('Failed to fetch stored latency data:', err);
+    });
+
+    return () => { cancelled = true; };
+  }, [startTime, endTime, isTimeFiltered, currentConnection?.id]);
+
+  // Convert stored snapshots to LatencyEvent[] shape, keeping only the latest per eventName
+  const storedAsEvents: LatencyEvent[] | null = storedSnapshots
+    ? Object.values(
+        storedSnapshots.reduce<Record<string, LatencyEvent>>((acc, s) => {
+          if (!acc[s.eventName] || s.latestEventTimestamp > acc[s.eventName].timestamp) {
+            acc[s.eventName] = { eventName: s.eventName, latency: s.maxLatency, timestamp: s.latestEventTimestamp };
+          }
+          return acc;
+        }, {}),
+      )
+    : null;
+
+  const latencyEvents = isTimeFiltered ? storedAsEvents : liveLatencyEvents;
+  const histogramData = isTimeFiltered ? storedHistogramData : liveHistogramData;
 
   useEffect(() => {
     if (selectedEvent) {
@@ -141,7 +201,10 @@ export function Latency() {
 
   return (
     <div className="space-y-6">
-      <h1 className="text-3xl font-bold">Latency Monitoring</h1>
+      <div className="flex items-center justify-between">
+        <h1 className="text-3xl font-bold">Latency Monitoring</h1>
+        <DateRangePicker value={dateRange} onChange={setDateRange} />
+      </div>
 
       <DoctorCard
         title="Latency Doctor"
