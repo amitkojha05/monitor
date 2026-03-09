@@ -147,14 +147,16 @@ function AppLayout({ cloudUser }: { cloudUser: CloudUser | null }) {
           <NavItem to="/webhooks" active={location.pathname === '/webhooks'}>
             Webhooks
           </NavItem>
-          <NavItem to="/helper" active={location.pathname === '/helper'}>
-            <span className="flex items-center justify-between w-full">
-              AI Helper
-              <span className="text-[10px] px-1.5 py-0.5 bg-amber-500 text-amber-950 rounded font-medium">
-                Experimental
+          {!cloudUser && (
+            <NavItem to="/helper" active={location.pathname === '/helper'}>
+              <span className="flex items-center justify-between w-full">
+                AI Helper
+                <span className="text-[10px] px-1.5 py-0.5 bg-amber-500 text-amber-950 rounded font-medium">
+                  Experimental
+                </span>
               </span>
-            </span>
-          </NavItem>
+            </NavItem>
+          )}
         </nav>
         <div className="px-3 pb-4 border-t border-gray-200 pt-2 space-y-1">
           <a
