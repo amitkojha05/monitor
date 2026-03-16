@@ -34,6 +34,10 @@ import type {
   StoredMemorySnapshot,
   VectorIndexInfo,
   VectorSearchResult,
+  VectorIndexSnapshot,
+  TextSearchResult,
+  FieldDistribution,
+  ProfileResult,
 } from '../types/metrics';
 import type {
   DiscoveredNode,
@@ -360,6 +364,30 @@ export const metricsApi = {
   vectorSearch: (indexName: string, params: { sourceKey: string; vectorField: string; k?: number; filter?: string }) =>
     fetchApi<{ results: VectorSearchResult[]; query: { sourceKey: string; vectorField: string; k: number; filter?: string } }>(
       `/vector-search/indexes/${encodeURIComponent(indexName)}/search`,
+      { method: 'POST', body: JSON.stringify(params) },
+    ),
+  getVectorIndexSnapshots: (name: string, hours?: number) => {
+    const q = new URLSearchParams();
+    if (hours) q.set('hours', hours.toString());
+    const qs = q.toString();
+    return fetchApi<{ snapshots: VectorIndexSnapshot[] }>(
+      `/vector-search/indexes/${encodeURIComponent(name)}/snapshots${qs ? `?${qs}` : ''}`,
+    );
+  },
+  textSearch: (indexName: string, params: { query: string; offset?: number; limit?: number }) =>
+    fetchApi<TextSearchResult>(
+      `/vector-search/indexes/${encodeURIComponent(indexName)}/text-search`,
+      { method: 'POST', body: JSON.stringify(params) },
+    ),
+  getTagValues: (indexName: string, fieldName: string) =>
+    fetchApi<{ values: string[] }>(`/vector-search/indexes/${encodeURIComponent(indexName)}/fields/${encodeURIComponent(fieldName)}/tagvals`),
+  getFieldDistribution: (indexName: string, fieldName: string, fieldType: string) =>
+    fetchApi<FieldDistribution>(`/vector-search/indexes/${encodeURIComponent(indexName)}/fields/${encodeURIComponent(fieldName)}/distribution?type=${fieldType}`),
+  getSearchConfig: () =>
+    fetchApi<{ config: Record<string, string> }>('/vector-search/config'),
+  profileSearch: (indexName: string, params: { query: string; limited?: boolean }) =>
+    fetchApi<ProfileResult>(
+      `/vector-search/indexes/${encodeURIComponent(indexName)}/profile`,
       { method: 'POST', body: JSON.stringify(params) },
     ),
   sampleIndexKeys: (indexName: string, params?: { cursor?: string; limit?: number }) => {

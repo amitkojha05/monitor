@@ -16,6 +16,8 @@ import {
   ConfigGetResponse,
   VectorIndexInfo,
   VectorSearchResult,
+  TextSearchResult,
+  ProfileResult,
 } from '../types/metrics.types';
 import type { KeyAnalyticsOptions, KeyAnalyticsResult } from '@betterdb/shared';
 
@@ -77,5 +79,9 @@ export interface DatabasePort {
   getVectorIndexInfo(indexName: string): Promise<VectorIndexInfo>;
   getHashFieldBuffer(key: string, field: string): Promise<Buffer | null>;
   vectorSearch(indexName: string, vectorFieldName: string, queryVector: Buffer, k: number, filter?: string): Promise<VectorSearchResult[]>;
+  textSearch(indexName: string, query: string, offset?: number, limit?: number): Promise<TextSearchResult>;
+  getTagValues(indexName: string, fieldName: string): Promise<string[]>;
+  getSearchConfig(pattern?: string): Promise<Record<string, string>>;
+  profileSearch(indexName: string, query: string, limited?: boolean): Promise<ProfileResult>;
   getClient(): Valkey;
 }
