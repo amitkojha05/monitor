@@ -4,6 +4,11 @@
   "description": "Valkey-native semantic cache for LLM applications with built-in OpenTelemetry and Prometheus instrumentation",
   "keywords": ["valkey", "redis", "semantic-cache", "llm", "opentelemetry", "prometheus"],
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/BetterDB-inc/monitor",
+    "directory": "packages/semantic-cache"
+  },
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
   "exports": {
