@@ -6,7 +6,7 @@ import { Tier, validateEventsForTier, getRequiredTierForEvent, getEventsForTier,
 import { StoragePort } from '../common/interfaces/storage-port.interface';
 import { CreateWebhookDto, UpdateWebhookDto } from '../common/dto/webhook.dto';
 import { ConnectionRegistry } from '../connections/connection-registry.service';
-import { LicenseService } from '@proprietary/license';
+import { LicenseService } from '@proprietary/licenses';
 
 @Injectable()
 export class WebhooksService {

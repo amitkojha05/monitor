@@ -1,7 +1,7 @@
 import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
 import { WebhookDispatcherService } from '@app/webhooks/webhook-dispatcher.service';
 import { WebhookEventType } from '@betterdb/shared';
-import { LicenseService } from '@proprietary/license';
+import { LicenseService } from '@proprietary/licenses';
 
 /**
  * Webhook Events Enterprise Service - Generates ENTERPRISE tier webhook events

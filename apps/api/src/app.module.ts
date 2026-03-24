@@ -37,7 +37,7 @@ try {
 }
 
 try {
-  const licenseModule = require('../../../proprietary/license/license.module');
+  const licenseModule = require('../../../proprietary/licenses/license.module');
   LicenseModule = licenseModule.LicenseModule;
   console.log('[License] Proprietary module loaded');
 } catch {

@@ -85,7 +85,7 @@ async function bootstrap(): Promise<void> {
   // Register startup error handlers — report fatal errors within the first 60s
   let licenseService: { sendStartupError(msg: string, cat: string): Promise<void> } | null = null;
   try {
-    const { LicenseService } = require('../../../proprietary/license/license.service');
+    const { LicenseService } = require('../../../proprietary/licenses/license.service');
     licenseService = app.get(LicenseService);
   } catch {
     // LicenseService not available — skip startup error reporting

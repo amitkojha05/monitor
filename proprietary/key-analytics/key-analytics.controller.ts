@@ -1,8 +1,8 @@
 import { Controller, Get, Post, Delete, Query, UseGuards, HttpCode, HttpStatus } from '@nestjs/common';
 import { ApiHeader } from '@nestjs/swagger';
 import { KeyAnalyticsService } from './key-analytics.service';
-import { LicenseGuard } from '@proprietary/license/license.guard';
-import { RequiresFeature } from '@proprietary/license/requires-feature.decorator';
+import { LicenseGuard } from '@proprietary/licenses/license.guard';
+import { RequiresFeature } from '@proprietary/licenses/requires-feature.decorator';
 import { ConnectionId, CONNECTION_ID_HEADER } from '../../apps/api/src/common/decorators';
 
 const MAX_LIMIT = 500;

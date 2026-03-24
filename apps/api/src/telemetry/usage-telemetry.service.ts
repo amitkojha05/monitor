@@ -1,5 +1,5 @@
 import { Injectable, Optional, OnModuleInit } from '@nestjs/common';
-import { LicenseService } from '@proprietary/license';
+import { LicenseService } from '@proprietary/licenses';
 
 @Injectable()
 export class UsageTelemetryService implements OnModuleInit {

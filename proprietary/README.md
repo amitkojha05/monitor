@@ -22,7 +22,7 @@ Contact sales@betterdb.com for commercial licensing options, or visit [betterdb.
 
 ## Features in This Directory
 
-### License (`/license`)
+### License (`/licenses`)
 License validation and feature gating infrastructure.
 - Provides `LicenseGuard` and `@RequiresFeature()` decorator
 - Checks `BETTERDB_LICENSE_KEY` env var

@@ -3,7 +3,7 @@ import { BadRequestException, ForbiddenException } from '@nestjs/common';
 import { WebhooksService } from '../webhooks.service';
 import { StoragePort } from '../../common/interfaces/storage-port.interface';
 import { ConnectionRegistry } from '../../connections/connection-registry.service';
-import { LicenseService } from '@proprietary/license';
+import { LicenseService } from '@proprietary/licenses';
 import { WebhookEventType, Tier } from '@betterdb/shared';
 
 describe('WebhooksService', () => {

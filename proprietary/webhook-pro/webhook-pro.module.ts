@@ -3,7 +3,7 @@ import { ConfigModule } from '@nestjs/config';
 import { StorageModule } from '@app/storage/storage.module';
 import { WebhooksModule } from '@app/webhooks/webhooks.module';
 import { SettingsModule } from '@app/settings/settings.module';
-import { LicenseModule } from '@proprietary/license';
+import { LicenseModule } from '@proprietary/licenses';
 import { WebhookProService } from './webhook-pro.service';
 import { WebhookAnomalyIntegrationService } from './webhook-anomaly-integration.service';
 import { WebhookDlqService } from './webhook-dlq.service';

@@ -3,7 +3,7 @@ import { HealthResponse, DetailedHealthResponse, WebhookEventType, ANOMALY_SERVI
 import { ConnectionRegistry } from '../connections/connection-registry.service';
 import { RuntimeCapabilityTracker } from '../connections/runtime-capability-tracker.service';
 import { WebhookDispatcherService } from '../webhooks/webhook-dispatcher.service';
-import { LicenseService } from '@proprietary/license';
+import { LicenseService } from '@proprietary/licenses';
 import { MultiConnectionPoller, ConnectionContext } from '../common/services/multi-connection-poller';
 
 @Injectable()

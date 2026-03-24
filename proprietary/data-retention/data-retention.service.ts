@@ -1,7 +1,7 @@
 import { Injectable, Logger, Inject } from '@nestjs/common';
 import { Cron } from '@nestjs/schedule';
-import { LicenseService } from '@proprietary/license/license.service';
-import { Tier } from '@proprietary/license/types';
+import { LicenseService } from '@proprietary/licenses/license.service';
+import { Tier } from '@proprietary/licenses/types';
 import { StoragePort } from '@app/common/interfaces/storage-port.interface';
 
 const RETENTION_DAYS: Record<Tier, number> = {

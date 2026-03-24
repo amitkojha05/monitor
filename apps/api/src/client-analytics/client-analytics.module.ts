@@ -4,7 +4,7 @@ import { ClientAnalyticsService } from './client-analytics.service';
 import { ClientAnalyticsAnalysisService } from './client-analytics-analysis.service';
 import { StorageModule } from '../storage/storage.module';
 import { PrometheusModule } from '../prometheus/prometheus.module';
-import { LicenseModule } from '@proprietary/license';
+import { LicenseModule } from '@proprietary/licenses';
 
 @Module({
   imports: [StorageModule, PrometheusModule, LicenseModule],

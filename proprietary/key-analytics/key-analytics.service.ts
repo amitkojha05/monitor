@@ -2,8 +2,8 @@ import { Injectable, Logger, OnModuleInit, Inject } from '@nestjs/common';
 import { StoragePort, KeyPatternSnapshot, HotKeyEntry, HotKeyQueryOptions } from '@app/common/interfaces/storage-port.interface';
 import { MultiConnectionPoller, ConnectionContext } from '@app/common/services/multi-connection-poller';
 import { ConnectionRegistry } from '@app/connections/connection-registry.service';
-import { LicenseService } from '@proprietary/license/license.service';
-import { Tier } from '@proprietary/license/types';
+import { LicenseService } from '@proprietary/licenses/license.service';
+import { Tier } from '@proprietary/licenses/types';
 import { randomUUID } from 'crypto';
 
 const HOT_KEYS_TOP_N = 50;

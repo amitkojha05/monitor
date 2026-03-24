@@ -9,7 +9,7 @@ import {
   MetricType,
   AnomalyPattern,
 } from './types';
-import { LicenseGuard, RequiresFeature, Feature } from '@proprietary/license';
+import { LicenseGuard, RequiresFeature, Feature } from '@proprietary/licenses';
 import { ConnectionId, CONNECTION_ID_HEADER } from '../../apps/api/src/common/decorators';
 
 @Controller('anomaly')

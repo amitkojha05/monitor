@@ -2,7 +2,7 @@ import { Module } from '@nestjs/common';
 import { KeyAnalyticsService } from './key-analytics.service';
 import { KeyAnalyticsController } from './key-analytics.controller';
 import { StorageModule } from '@app/storage/storage.module';
-import { LicenseModule } from '@proprietary/license/license.module';
+import { LicenseModule } from '@proprietary/licenses/license.module';
 
 @Module({
   imports: [StorageModule, LicenseModule],
