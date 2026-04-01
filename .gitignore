@@ -46,6 +46,16 @@ pnpm-debug.log*
 .env.test.local
 .env.production.local
 
+# Build info
+*.tsbuildinfo
+
+# Claude Code
+.claude/settings.local.json
+
+# BetterDB context
+.betterdb_context.md
+**/.betterdb_context.md
+
 # Turbo
 .turbo
 
