@@ -81,6 +81,8 @@ jobs:
           cache-to: type=gha,mode=max,scope=with-ai
           build-args: |
             APP_VERSION=${{ steps.version.outputs.version }}
+            VITE_PUBLIC_POSTHOG_PROJECT_TOKEN=${{ secrets.VITE_PUBLIC_POSTHOG_PROJECT_TOKEN }}
+            POSTHOG_API_KEY=${{ secrets.POSTHOG_API_KEY }}
 
       - name: Build and push (without AI)
         id: push-without-ai
@@ -98,6 +100,8 @@ jobs:
           cache-to: type=gha,mode=max,scope=without-ai
           build-args: |
             APP_VERSION=${{ steps.version.outputs.version }}
+            VITE_PUBLIC_POSTHOG_PROJECT_TOKEN=${{ secrets.VITE_PUBLIC_POSTHOG_PROJECT_TOKEN }}
+            POSTHOG_API_KEY=${{ secrets.POSTHOG_API_KEY }}
 
       - name: Generate artifact attestation (with AI)
         uses: actions/attest-build-provenance@v2
