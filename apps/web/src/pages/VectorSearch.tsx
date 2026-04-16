@@ -774,6 +774,7 @@ function humanizeFieldName(name: string): string {
 }
 
 function formatRelativeTime(timestamp: number): string {
+  if (!Number.isFinite(timestamp)) return 'unknown';
   const rtf = new Intl.RelativeTimeFormat('en', { numeric: 'auto' });
   const delta = timestamp - Date.now();
   const abs = Math.abs(delta);
@@ -941,6 +942,7 @@ function FieldGrid({ fields, fieldMeta, docKey }: { fields: Record<string, strin
         const byRelative = new Map<string, { names: string[]; iso: string }>();
         for (const { key: k, value: v } of groups.temporal) {
           const ts = parseTimestampValue(v);
+          if (!Number.isFinite(ts)) continue;
           const rel = formatRelativeTime(ts);
           const existing = byRelative.get(rel);
           if (existing) {
