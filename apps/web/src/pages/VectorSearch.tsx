@@ -1407,7 +1407,7 @@ function SearchTester({ info }: { info: VectorIndexInfo }) {
                         <td className="px-3 py-1.5 text-right">
                           <button
                             onClick={e => { e.stopPropagation(); handleFindSimilar(result.key); }}
-                            className="text-[11px] text-primary hover:text-primary/80 font-medium"
+                            className="text-[11px] text-primary hover:text-primary/80 font-medium px-2 py-1 cursor-pointer"
                             title={`Find keys similar to ${result.key}`}
                           >
                             Find similar
@@ -1521,7 +1521,7 @@ function SearchTester({ info }: { info: VectorIndexInfo }) {
                             <td className="px-3 py-1.5 text-right">
                               <button
                                 onClick={e => { e.stopPropagation(); handleFindSimilar(row.key); }}
-                                className="text-[11px] text-primary hover:text-primary/80 font-medium"
+                                className="text-[11px] text-primary hover:text-primary/80 font-medium px-2 py-1 cursor-pointer"
                                 title={`Find keys similar to ${row.key}`}
                               >
                                 Find similar
