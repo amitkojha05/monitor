@@ -40,9 +40,7 @@ import {
 
 const INVALIDATE_BATCH_SIZE = 1000;
 
-// Keep in sync with package.json. Baked into the discovery marker so Monitor
-// can surface the running library version without a live RPC.
-const PACKAGE_VERSION = '0.2.0';
+const PACKAGE_VERSION = (require('../package.json') as { version: string }).version;
 
 function errMsg(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
@@ -998,11 +996,14 @@ export class SemanticCache {
       const { dim, hasBinaryRefs } = await this.ensureIndexAndGetDimension();
       if (this._initGeneration !== gen) return;
       this._dimension = dim;
+<<<<<<< HEAD
       this._hasBinaryRefs = hasBinaryRefs;
       // registerDiscovery() may throw SemanticCacheUsageError on a name
       // collision. Mark the cache initialized only after discovery succeeds
       // so a colliding caller cannot subsequently call check()/store()
       // against another owner's keys.
+=======
+>>>>>>> 1033b74 (chore(semantic-cache): tighten discovery module)
       await this.registerDiscovery();
       if (this._initGeneration !== gen) return;
       this._initialized = true;

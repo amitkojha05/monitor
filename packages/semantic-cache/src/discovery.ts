@@ -12,14 +12,12 @@ export const HEARTBEAT_KEY_PREFIX = '__betterdb:heartbeat:';
 export const DEFAULT_HEARTBEAT_INTERVAL_MS = 30_000;
 export const HEARTBEAT_TTL_SECONDS = 60;
 
-export type CacheType = 'semantic_cache' | 'agent_cache';
+export const CACHE_TYPE = 'semantic_cache' as const;
+export type CacheType = typeof CACHE_TYPE;
 
 export interface DiscoveryOptions {
-  /** Set to false to skip all registry writes. Default: true. */
   enabled?: boolean;
-  /** Heartbeat interval in ms. Default: 30000. Exposed mainly for tests. */
   heartbeatIntervalMs?: number;
-  /** Include per-category thresholds in the published marker. Default: true. */
   includeCategories?: boolean;
 }
 
@@ -47,13 +45,10 @@ export interface BuildSemanticMetadataInput {
 
 export function buildSemanticMetadata(input: BuildSemanticMetadataInput): MarkerMetadata {
   const metadata: MarkerMetadata = {
-    type: 'semantic_cache',
+    type: CACHE_TYPE,
     prefix: input.name,
     version: input.version,
     protocol_version: PROTOCOL_VERSION,
-    // threshold_adjust is intentionally omitted until SemanticCache.check()
-    // re-reads the {name}:__config hash at runtime. See
-    // docs/plans/specs/spec-semantic-cache-discovery-markers.md "Open questions".
     capabilities: ['invalidate', 'similarity_distribution'],
     index_name: `${input.name}:idx`,
     stats_key: `${input.name}:__stats`,
@@ -90,23 +85,9 @@ export interface DiscoveryManagerDeps {
   metadata: MarkerMetadata;
   heartbeatIntervalMs?: number;
   logger?: DiscoveryLogger;
-  /** Called each time a best-effort write fails (HGET/HSET/SET protocol/heartbeat). */
   onWriteFailed?: () => void;
 }
 
-/**
- * Implements the shared `__betterdb:*` discovery marker protocol for
- * semantic-cache. See docs/plans/specs/spec-semantic-cache-discovery-markers.md
- * for the full contract.
- *
- * Semantics:
- * - `register()` throws on name collision (different cache type already
- *   registered under this name). All other Valkey errors are logged and
- *   swallowed; discovery is advisory, never a hard failure for the cache.
- * - `stop({ deleteHeartbeat: true })` is called from both `flush()` (drops
- *   the cache) and `dispose()` (graceful shutdown). Neither touches the
- *   registry hash — Monitor retains history.
- */
 export class DiscoveryManager {
   private readonly client: Valkey;
   private readonly name: string;
@@ -143,9 +124,6 @@ export class DiscoveryManager {
       'SET protocol',
     );
 
-    // Write the initial heartbeat synchronously so Monitor sees the cache as
-    // alive immediately after register() returns, instead of waiting up to
-    // heartbeatIntervalMs for the first scheduled tick.
     await this.tickHeartbeat();
 
     this.startHeartbeat();
@@ -166,7 +144,6 @@ export class DiscoveryManager {
     }
   }
 
-  /** Exposed for tests. Writes the heartbeat key with TTL. */
   async tickHeartbeat(): Promise<void> {
     const now = new Date().toISOString();
     try {
@@ -211,7 +188,7 @@ export class DiscoveryManager {
     } catch {
       return;
     }
-    if (parsed.type && parsed.type !== this.metadata.type) {
+    if (parsed.type && parsed.type !== CACHE_TYPE) {
       throw new SemanticCacheUsageError(
         `cache name collision: '${this.name}' is already registered as type '${String(parsed.type)}' on this Valkey instance`,
       );
