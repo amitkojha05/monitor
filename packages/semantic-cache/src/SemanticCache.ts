@@ -71,7 +71,6 @@ export class SemanticCache {
   private _hasBinaryRefs = false;
   private _initPromise: Promise<void> | null = null;
   private _initGeneration = 0;
-  private _disposed = false;
 
   private readonly analyticsOpts: SemanticCacheOptions['analytics'];
   private readonly usesDefaultCostTable: boolean;
@@ -200,7 +199,9 @@ export class SemanticCache {
    * entries. Safe to call multiple times.
    */
   async dispose(): Promise<void> {
-    this._disposed = true;
+    if (this._initPromise) {
+      await this._initPromise.catch(() => {});
+    }
     if (this.discovery) {
       await this.discovery.stop({ deleteHeartbeat: true });
       this.discovery = null;
@@ -993,11 +994,10 @@ export class SemanticCache {
   // -- Private helpers --
 
   private async _doInitialize(): Promise<void> {
-    this._disposed = false;
     const gen = this._initGeneration;
     return this.traced('initialize', async () => {
       const { dim, hasBinaryRefs } = await this.ensureIndexAndGetDimension();
-      if (this._initGeneration !== gen || this._disposed) {
+      if (this._initGeneration !== gen) {
         return;
       }
       this._dimension = dim;
@@ -1007,7 +1007,7 @@ export class SemanticCache {
       // so a colliding caller cannot subsequently call check()/store()
       // against another owner's keys.
       const manager = await this.registerDiscovery();
-      if (this._initGeneration !== gen || this._disposed) {
+      if (this._initGeneration !== gen) {
         if (manager) {
           await manager.stop({ deleteHeartbeat: true });
         }
