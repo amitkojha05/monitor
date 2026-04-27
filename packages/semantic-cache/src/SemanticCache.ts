@@ -146,9 +146,13 @@ export class SemanticCache {
     this._initPromise = null;
     this._initGeneration++;
 
-    if (this.discovery) {
-      await this.discovery.stop({ deleteHeartbeat: true });
-      this.discovery = null;
+    // Capture and null the discovery ref synchronously, before any await,
+    // so a concurrent _doInitialize() (started after _initGeneration++) can't
+    // race in and have its new manager overwritten by this flush.
+    const discoveryToStop = this.discovery;
+    this.discovery = null;
+    if (discoveryToStop) {
+      await discoveryToStop.stop({ deleteHeartbeat: true });
     }
 
     // Valkey Search 1.2 does not support the DD (Delete Documents) flag on
