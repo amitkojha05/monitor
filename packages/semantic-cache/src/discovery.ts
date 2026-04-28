@@ -155,6 +155,9 @@ export class DiscoveryManager {
   }
 
   private startHeartbeat(): void {
+    if (this.heartbeatHandle) {
+      clearInterval(this.heartbeatHandle);
+    }
     const handle = setInterval(() => {
       void this.tickHeartbeat();
     }, this.heartbeatIntervalMs);
