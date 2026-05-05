@@ -1,5 +1,22 @@
 # Changelog
 
+## [0.3.0] - 2026-05-05
+
+### Added
+
+- **Periodic config refresh** — `SemanticCache` polls `{prefix}:__config` every 30s and updates `default_threshold` / `category_thresholds` in-memory. First refresh fires synchronously on `initialize()` so a freshly-started process picks up an already-applied proposal immediately. Configure via the new `config_refresh` option; opt out with `config_refresh=ConfigRefreshOptions(enabled=False)`. New Prometheus counter `{prefix}_config_refresh_failed_total`.
+- **`refresh_config()`** — public method returning `bool` for manual refresh.
+- **`threshold_adjust` capability** — added to the discovery marker's `capabilities` array.
+- **`ConfigRefreshOptions`** type exported from the package.
+
+### Changed
+
+- Constructor values for `default_threshold` and `category_thresholds` are now used as fallbacks when the corresponding fields are absent from `__config`.
+
+### Behavior change
+
+- A `{prefix}:__config` Valkey hash that previously had no effect now drives `default_threshold` and `category_thresholds` at runtime. Audit existing keys before upgrading, or set `config_refresh=ConfigRefreshOptions(enabled=False)` to keep constructor values authoritative.
+
 ## [0.2.0] - 2026-05-04
 
 ### Added
