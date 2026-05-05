@@ -5,6 +5,38 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] - 2026-05-04
+
+### Added
+
+- **Periodic config refresh** — `SemanticCache` polls `{name}:__config` on a
+  configurable interval (default 30s) and updates `defaultThreshold` and
+  `categoryThresholds` in-memory. The first refresh fires synchronously on
+  `initialize()` so a freshly-started process picks up an already-applied
+  proposal without waiting for the first tick. Configure via the new
+  `configRefresh` option; opt out with `configRefresh: { enabled: false }`.
+  Hash field semantics: `threshold` → `defaultThreshold`,
+  `threshold:{category}` → `categoryThresholds[category]`; out-of-range values
+  (`< 0`, `> 2`, NaN) are ignored. New Prometheus counter
+  `{prefix}_config_refresh_failed_total`.
+- **`refreshConfig()`** — public method returning `boolean` for manual refresh.
+- **`threshold_adjust` capability** — added to the discovery marker's
+  `capabilities` array. Monitor's apply dispatcher gates on this before writing
+  the config hash.
+- **`ConfigRefreshOptions`** type exported from the package root.
+
+### Changed
+
+- Constructor values for `defaultThreshold` and `categoryThresholds` are now
+  used as fallbacks when corresponding fields are absent from `__config`.
+
+### Behavior change
+
+- A `{prefix}:__config` Valkey hash that previously had no effect now drives
+  `defaultThreshold` and `categoryThresholds` at runtime. Audit existing keys
+  before upgrading, or set `configRefresh: { enabled: false }` to keep the
+  constructor values authoritative.
+
 ## [0.3.0] - 2026-04-27
 
 ### Added
