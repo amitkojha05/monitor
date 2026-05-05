@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "betterdb-agent-cache"
-version = "0.4.0"
+version = "0.6.0"
 description = "Multi-tier exact-match cache for AI agent workloads backed by Valkey. LLM responses, tool results, and session state with built-in OpenTelemetry and Prometheus instrumentation."
 keywords = [
     "valkey",
@@ -35,6 +35,7 @@ langgraph = ["langgraph>=0.1.0"]
 llamaindex = ["llama-index-core>=0.10.0"]
 openai_agents = ["openai-agents>=0.0.14"]
 analytics = ["posthog>=3.0.0"]
+normalizer = ["aiohttp>=3.9.0"]
 dev = [
     "pytest>=8.0.0",
     "pytest-asyncio>=0.23.0",
@@ -49,6 +50,7 @@ all = [
     "llama-index-core>=0.10.0",
     "posthog>=3.0.0",
     "openai-agents>=0.0.14",
+    "aiohttp>=3.9.0",
 ]
 
 [project.urls]

@@ -1,0 +1,12 @@
+{
+  "extends": "./tsconfig.json",
+  "exclude": [
+    "node_modules",
+    "dist",
+    "../../proprietary/entitlement/**/*",
+    "../../proprietary/infra/**/*",
+    "src/**/*.spec.ts",
+    "src/**/__tests__/**/*",
+    "test/**/*"
+  ]
+}
