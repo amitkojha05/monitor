@@ -36,6 +36,9 @@ Limitations
 * ``tools``, ``handoffs``, and ``output_schema`` are excluded from the
   cache key — safe when one CachedModel wraps a single Agent whose tools
   don't change between calls.
+* ``ResponseOutputRefusal`` content is stored as a plain text block; the
+  cached hit returns the refusal message as text rather than a typed refusal
+  object.
 """
 from __future__ import annotations
 
@@ -104,7 +107,8 @@ async def prepare_params(
     opts: OpenAIAgentsPrepareOptions | None = None,
 ) -> LlmCacheParams:
     """Convert OpenAI Agents SDK get_response() args to canonical ``LlmCacheParams``."""
-    _ = opts
+    # opts.normalizer is reserved for follow-up binary/multimodal normalizer
+    # dispatch in _normalize_input_item — matching the peer adapter API surface.
 
     messages: list[Any] = []
 
@@ -183,6 +187,15 @@ def _extract_blocks(response: Any) -> list[ContentBlock]:
                     else:
                         text_val = getattr(part, "text", "") or ""
                     blocks.append({"type": "text", "text": text_val})
+                elif part_type == "refusal":
+                    # ResponseOutputRefusal — store refusal text so cache hits
+                    # preserve the refusal content rather than silently dropping it.
+                    refusal_text = ""
+                    if isinstance(part, dict):
+                        refusal_text = part.get("refusal") or ""
+                    else:
+                        refusal_text = getattr(part, "refusal", "") or ""
+                    blocks.append({"type": "text", "text": refusal_text})
         elif item_type == "function_call":
             if isinstance(item, dict):
                 call_id = item.get("call_id", "")
