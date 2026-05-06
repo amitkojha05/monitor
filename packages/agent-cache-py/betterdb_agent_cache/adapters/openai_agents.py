@@ -67,10 +67,7 @@ def _to_text(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True)
 
 
-async def _normalize_input_item(
-    item: Any,
-    normalizer: BinaryNormalizer,
-) -> dict[str, Any]:  # noqa: ARG001
+async def _normalize_input_item(item: Any) -> dict[str, Any]:
     """Reduce a single Responses API input item to a canonical dict for hashing.
 
     .. note::
@@ -102,11 +99,9 @@ async def prepare_params(
     input: str | list[Any],
     model_name: str,
     model_settings: Any | None = None,
-    opts: OpenAIAgentsPrepareOptions | None = None,
+    opts: OpenAIAgentsPrepareOptions | None = None,  # noqa: ARG001
 ) -> LlmCacheParams:
     """Convert OpenAI Agents SDK get_response() args to canonical ``LlmCacheParams``."""
-    normalizer = opts.normalizer if opts else default_normalizer
-
     messages: list[Any] = []
 
     if system_instructions:
@@ -116,7 +111,7 @@ async def prepare_params(
         messages.append({"role": "user", "content": [{"type": "text", "text": input}]})
     else:
         for item in input:
-            messages.append(await _normalize_input_item(item, normalizer))
+            messages.append(await _normalize_input_item(item))
 
     result: LlmCacheParams = {"model": model_name, "messages": messages}
 
@@ -147,6 +142,14 @@ async def prepare_params(
         result["stop"] = [stop] if isinstance(stop, str) else stop
     if settings.get("tool_choice") is not None:
         result["tool_choice"] = settings["tool_choice"]
+    if settings.get("frequency_penalty") is not None:
+        result["frequency_penalty"] = settings["frequency_penalty"]
+    if settings.get("presence_penalty") is not None:
+        result["presence_penalty"] = settings["presence_penalty"]
+    if settings.get("parallel_tool_calls") is not None:
+        result["parallel_tool_calls"] = settings["parallel_tool_calls"]
+    if settings.get("reasoning") is not None:
+        result["reasoning"] = settings["reasoning"]
 
     return result
 
@@ -366,6 +369,11 @@ class CachedModel:
         # tools, handoffs, and output_schema are excluded from the cache key.
         # This is safe when one CachedModel wraps a single Agent whose tools
         # don't change between calls — the typical usage pattern.
+        # previous_response_id, conversation_id, and prompt are also excluded:
+        # they are server-side context references, not content. Including them
+        # would prevent caching the same logical prompt across conversation turns.
+        # If server-side context affects your responses, create separate
+        # CachedModel instances per conversation thread.
         params = await prepare_params(
             system_instructions, input, model_name, model_settings, self._opts,
         )
@@ -373,7 +381,10 @@ class CachedModel:
         cached = await self._cache.llm.check(params)
         if cached.hit:
             output = _rebuild_output(cached.content_blocks, cached.response)
-            return _cache_hit_model_response(output, _make_usage(0, 0))
+            return _cache_hit_model_response(
+                output,
+                _make_usage(cached.input_tokens, cached.output_tokens),
+            )
 
         response = await self._model.get_response(
             system_instructions,

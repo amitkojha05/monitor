@@ -229,6 +229,30 @@ async def test_cached_model_hit_skips_underlying():
     )
     assert base.calls == 0
     assert hasattr(out, "output")
+    # Verify usage carries stored token counts from the miss (10 input, 5 output per _make_text_response)
+    # Note: when stored via store_multipart with no LlmStoreOptions, tokens default to 0
+    assert out.usage.input_tokens == 0
+    assert out.usage.output_tokens == 0
+
+
+@pytest.mark.asyncio
+async def test_cached_model_hit_propagates_stored_tokens():
+    """Cache hit returns Usage with the token counts from the original miss."""
+    cache = _make_cache()
+    response = _make_text_response("response with tokens")
+    # _make_text_response sets usage.input_tokens=10, output_tokens=5
+    base = _FakeModel(response)
+    wrapped = CachedModel(base, cache)
+
+    # Miss: stores with real token counts (10 input, 5 output from _make_text_response)
+    await wrapped.get_response(None, "prompt", None, **_DEFAULT_KWARGS)
+    assert base.calls == 1
+
+    # Hit: should return stored token counts
+    out = await wrapped.get_response(None, "prompt", None, **_DEFAULT_KWARGS)
+    assert base.calls == 1  # not called again
+    assert out.usage.input_tokens == 10
+    assert out.usage.output_tokens == 5
 
 
 @pytest.mark.asyncio
