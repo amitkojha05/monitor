@@ -67,7 +67,9 @@ def _to_text(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True)
 
 
-async def _normalize_input_item(item: Any) -> dict[str, Any]:
+async def _normalize_input_item(
+    item: Any,
+) -> dict[str, Any]:
     """Reduce a single Responses API input item to a canonical dict for hashing.
 
     .. note::
@@ -99,9 +101,11 @@ async def prepare_params(
     input: str | list[Any],
     model_name: str,
     model_settings: Any | None = None,
-    opts: OpenAIAgentsPrepareOptions | None = None,  # noqa: ARG001
+    opts: OpenAIAgentsPrepareOptions | None = None,
 ) -> LlmCacheParams:
     """Convert OpenAI Agents SDK get_response() args to canonical ``LlmCacheParams``."""
+    _ = opts
+
     messages: list[Any] = []
 
     if system_instructions:

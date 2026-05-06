@@ -16,7 +16,13 @@ from betterdb_agent_cache.types import AgentCacheOptions, TierDefaults
 
 from ..conftest import make_persisting_valkey_client
 
-pytest.importorskip("agents")
+try:
+    import agents  # noqa: F401
+except Exception as exc:  # pragma: no cover - environment dependent
+    pytest.skip(
+        f"openai-agents unavailable or incompatible in this environment: {exc}",
+        allow_module_level=True,
+    )
 
 
 def _make_cache() -> AgentCache:
