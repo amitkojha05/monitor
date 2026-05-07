@@ -151,7 +151,7 @@ export class ProvisioningService {
 
       // Step 7: Create K8s Deployment
       this.logger.log(`[${tenant.subdomain}] Creating K8s deployment`);
-      await this.createDeployment(namespace, tenant.subdomain, imageTag, schemaName);
+      await this.createDeployment(namespace, tenant.subdomain, imageTag, schemaName, tenant.isDemo);
 
       // Step 8: Create K8s Service
       this.logger.log(`[${tenant.subdomain}] Creating K8s service`);
@@ -159,13 +159,18 @@ export class ProvisioningService {
 
       // Step 9: Create K8s Ingress
       this.logger.log(`[${tenant.subdomain}] Creating K8s ingress for ${hostname}`);
-      await this.createIngress(namespace, tenant.subdomain, hostname);
+      await this.createIngress(namespace, tenant.subdomain, hostname, tenant.isDemo ? [this.demoHostname()] : []);
 
       // Step 10: Wait for ALB to assign a hostname and create Route53 CNAME
       this.logger.log(`[${tenant.subdomain}] Waiting for ALB hostname...`);
       const albHostname = await this.waitForIngressHostname(namespace, 3 * 60 * 1000);
       this.logger.log(`[${tenant.subdomain}] Creating Route53 CNAME → ${albHostname}`);
       await this.createRoute53Record(tenant.subdomain, albHostname);
+
+      if (tenant.isDemo) {
+        this.logger.log(`[${tenant.subdomain}] Creating demo Route53 CNAME → ${albHostname}`);
+        await this.createRoute53Record('demo', albHostname);
+      }
 
       // Step 11: Wait for deployment readiness
       this.logger.log(`[${tenant.subdomain}] Waiting for deployment readiness...`);
@@ -214,6 +219,11 @@ export class ProvisioningService {
       // Step 3: Delete Route53 CNAME record
       this.logger.log(`[${tenant.subdomain}] Deleting Route53 CNAME record`);
       await this.deleteRoute53Record(tenant.subdomain);
+
+      if (tenant.isDemo) {
+        this.logger.log(`[${tenant.subdomain}] Deleting demo Route53 CNAME record`);
+        await this.deleteRoute53Record('demo');
+      }
 
       // Step 4: Delete K8s Namespace (cascades to all resources)
       this.logger.log(`[${tenant.subdomain}] Deleting K8s namespace: ${namespace}`);
@@ -425,7 +435,7 @@ export class ProvisioningService {
         },
       });
     } catch (error: any) {
-      if ((error.statusCode ?? error.response?.statusCode ?? error.code) === 409) {
+      if (this.isAlreadyExistsError(error)) {
         this.logger.warn(`Namespace ${namespace} already exists, continuing...`);
       } else {
         throw error;
@@ -488,7 +498,7 @@ export class ProvisioningService {
         },
       });
     } catch (error: any) {
-      if ((error.statusCode ?? error.response?.statusCode ?? error.code) === 409) {
+      if (this.isAlreadyExistsError(error)) {
         this.logger.warn(`Secret db-credentials already exists in ${namespace}, continuing...`);
       } else {
         throw error;
@@ -499,10 +509,10 @@ export class ProvisioningService {
   private async createResourceQuota(namespace: string): Promise<void> {
     const quotaSpec = {
       hard: {
-        'requests.cpu': '250m',
-        'requests.memory': '256Mi',
-        'limits.cpu': '500m',
-        'limits.memory': '512Mi',
+        'requests.cpu': '300m',
+        'requests.memory': '320Mi',
+        'limits.cpu': '600m',
+        'limits.memory': '640Mi',
         'pods': '2', // Allow 2 pods: 1 for app + 1 for schema jobs
       },
     };
@@ -512,7 +522,7 @@ export class ProvisioningService {
         body: { metadata: { name: 'tenant-quota' }, spec: quotaSpec },
       });
     } catch (error: any) {
-      if ((error.statusCode ?? error.response?.statusCode ?? error.code) === 409) {
+      if (this.isAlreadyExistsError(error)) {
         await this.coreApi.patchNamespacedResourceQuota({
           name: 'tenant-quota',
           namespace,
@@ -524,7 +534,7 @@ export class ProvisioningService {
     }
   }
 
-  private async createDeployment(namespace: string, subdomain: string, imageTag: string, dbSchema: string): Promise<void> {
+  private async createDeployment(namespace: string, subdomain: string, imageTag: string, dbSchema: string, isDemo: boolean): Promise<void> {
     const image = `${this.ecrImage}:${imageTag}`;
 
     try {
@@ -580,6 +590,8 @@ export class ProvisioningService {
                       { name: 'STORAGE_TYPE', value: 'postgres' },
                       { name: 'DB_SCHEMA', value: dbSchema },
                       { name: 'NODE_TLS_REJECT_UNAUTHORIZED', value: '0' },
+                      ...(isDemo ? [{ name: 'DEMO_HOSTNAME', value: this.demoHostname() }] : []),
+                      ...(!isDemo && process.env.COOKIE_DOMAIN ? [{ name: 'COOKIE_DOMAIN', value: process.env.COOKIE_DOMAIN }] : []),
                       {
                         name: 'STORAGE_URL',
                         valueFrom: {
@@ -675,7 +687,7 @@ export class ProvisioningService {
         },
       });
     } catch (error: any) {
-      if ((error.statusCode ?? error.response?.statusCode ?? error.code) === 409) {
+      if (this.isAlreadyExistsError(error)) {
         this.logger.warn(`Deployment already exists in ${namespace}, continuing...`);
       } else {
         throw error;
@@ -706,7 +718,7 @@ export class ProvisioningService {
         },
       });
     } catch (error: any) {
-      if ((error.statusCode ?? error.response?.statusCode ?? error.code) === 409) {
+      if (this.isAlreadyExistsError(error)) {
         this.logger.warn(`Service already exists in ${namespace}, continuing...`);
       } else {
         throw error;
@@ -714,7 +726,8 @@ export class ProvisioningService {
     }
   }
 
-  private async createIngress(namespace: string, _subdomain: string, hostname: string): Promise<void> {
+  private async createIngress(namespace: string, _subdomain: string, hostname: string, extraHosts: string[] = []): Promise<void> {
+    const allHosts = [hostname, ...extraHosts];
     try {
       await this.networkingApi.createNamespacedIngress({
         namespace,
@@ -732,30 +745,28 @@ export class ProvisioningService {
           },
           spec: {
             ingressClassName: 'alb',
-            rules: [
-              {
-                host: hostname,
-                http: {
-                  paths: [
-                    {
-                      path: '/',
-                      pathType: 'Prefix',
-                      backend: {
-                        service: {
-                          name: 'betterdb',
-                          port: { number: 80 },
-                        },
+            rules: allHosts.map(host => ({
+              host,
+              http: {
+                paths: [
+                  {
+                    path: '/',
+                    pathType: 'Prefix',
+                    backend: {
+                      service: {
+                        name: 'betterdb',
+                        port: { number: 80 },
                       },
                     },
-                  ],
-                },
+                  },
+                ],
               },
-            ],
+            })),
           },
         },
       });
     } catch (error: any) {
-      if ((error.statusCode ?? error.response?.statusCode ?? error.code) === 409) {
+      if (this.isAlreadyExistsError(error)) {
         // Patch the group.name annotation so retries move the ingress to the current ALB group
         await this.networkingApi.patchNamespacedIngress({
           name: 'betterdb',
@@ -902,7 +913,7 @@ export class ProvisioningService {
         },
       });
     } catch (error: any) {
-      if ((error.statusCode ?? error.response?.statusCode ?? error.code) === 409) {
+      if (this.isAlreadyExistsError(error)) {
         this.logger.warn(`NetworkPolicy already exists in ${namespace}, continuing...`);
       } else {
         throw error;
@@ -968,6 +979,19 @@ export class ProvisioningService {
       },
     }));
     this.logger.log(`[${subdomain}] Route53 CNAME deleted`);
+  }
+
+  private demoHostname(): string {
+    return `demo.${this.appDomain}`;
+  }
+
+  private isAlreadyExistsError(error: any): boolean {
+    const code = error.statusCode ?? error.response?.statusCode ?? error.status;
+    if (code === 409) return true;
+    if (error.body?.code === 409 || error.body?.reason === 'AlreadyExists') return true;
+    // k8s client-node v1.x embeds the status code only in the message string
+    if (typeof error.message === 'string' && error.message.startsWith('HTTP-Code: 409')) return true;
+    return false;
   }
 
   private sleep(ms: number): Promise<void> {

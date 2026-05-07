@@ -1,4 +1,5 @@
 import { useLocation } from 'react-router-dom';
+import { useIsDemo } from '../../contexts/DemoContext';
 import { useCapabilities } from '../../hooks/useCapabilities';
 import { useCacheProposalsUnread } from '../../hooks/useCacheProposals';
 import { ConnectionSelector } from '../ConnectionSelector';
@@ -24,6 +25,7 @@ export function AppSidebar({ cloudUser, onFeedbackClick }: SidebarProps) {
   const location = useLocation();
   const { hasVectorSearch } = useCapabilities();
   const { unreadCount: cacheProposalsUnread } = useCacheProposalsUnread();
+  const isDemo = useIsDemo();
 
   return (
     <Sidebar className="bg-card">
@@ -100,7 +102,7 @@ export function AppSidebar({ cloudUser, onFeedbackClick }: SidebarProps) {
           <NavItem to="/audit" active={location.pathname === '/audit'}>
             Audit Trail
           </NavItem>
-          <NavItem to="/webhooks" active={location.pathname === '/webhooks'}>
+          <NavItem to="/webhooks" active={location.pathname === '/webhooks'} demoLocked={isDemo}>
             Webhooks
           </NavItem>
           <NavItem to="/migration" active={location.pathname === '/migration'}>
@@ -154,11 +156,11 @@ export function AppSidebar({ cloudUser, onFeedbackClick }: SidebarProps) {
             Feedback
           </button>
           {cloudUser && (
-            <NavItem to="/workspace/members" active={location.pathname === '/workspace/members'}>
+            <NavItem to="/workspace/members" active={location.pathname === '/workspace/members'} demoLocked={isDemo}>
               Team
             </NavItem>
           )}
-          <NavItem to="/settings" active={location.pathname === '/settings'}>
+          <NavItem to="/settings" active={location.pathname === '/settings'} demoLocked={isDemo}>
             Settings
           </NavItem>
         </div>
