@@ -36,7 +36,7 @@ spec:
     spec:
       containers:
         - name: betterdb
-          image: 811740411689.dkr.ecr.us-east-1.amazonaws.com/betterdb:v0.7.0
+          image: 811740411689.dkr.ecr.us-east-1.amazonaws.com/betterdb:v0.17.2
           imagePullPolicy: Always
           # image: betterdb/monitor:latest
           ports:
@@ -58,6 +58,8 @@ spec:
                   key: url
             - name: STORAGE_SSL_CA
               value: "https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem"
+            - name: BETTERDB_UNSAFE_CLI
+              value: "true"
           resources:
             requests:
               cpu: "250m"

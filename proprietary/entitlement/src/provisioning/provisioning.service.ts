@@ -425,7 +425,7 @@ export class ProvisioningService {
         },
       });
     } catch (error: any) {
-      if ((error.statusCode ?? error.response?.statusCode) === 409) {
+      if ((error.statusCode ?? error.response?.statusCode ?? error.code) === 409) {
         this.logger.warn(`Namespace ${namespace} already exists, continuing...`);
       } else {
         throw error;
@@ -488,7 +488,7 @@ export class ProvisioningService {
         },
       });
     } catch (error: any) {
-      if ((error.statusCode ?? error.response?.statusCode) === 409) {
+      if ((error.statusCode ?? error.response?.statusCode ?? error.code) === 409) {
         this.logger.warn(`Secret db-credentials already exists in ${namespace}, continuing...`);
       } else {
         throw error;
@@ -497,27 +497,27 @@ export class ProvisioningService {
   }
 
   private async createResourceQuota(namespace: string): Promise<void> {
+    const quotaSpec = {
+      hard: {
+        'requests.cpu': '250m',
+        'requests.memory': '256Mi',
+        'limits.cpu': '500m',
+        'limits.memory': '512Mi',
+        'pods': '2', // Allow 2 pods: 1 for app + 1 for schema jobs
+      },
+    };
     try {
       await this.coreApi.createNamespacedResourceQuota({
         namespace,
-        body: {
-          metadata: {
-            name: 'tenant-quota',
-          },
-          spec: {
-            hard: {
-              'requests.cpu': '250m',
-              'requests.memory': '256Mi',
-              'limits.cpu': '500m',
-              'limits.memory': '512Mi',
-              'pods': '2', // Allow 2 pods: 1 for app + 1 for schema jobs
-            },
-          },
-        },
+        body: { metadata: { name: 'tenant-quota' }, spec: quotaSpec },
       });
     } catch (error: any) {
-      if ((error.statusCode ?? error.response?.statusCode) === 409) {
-        this.logger.warn(`ResourceQuota already exists in ${namespace}, continuing...`);
+      if ((error.statusCode ?? error.response?.statusCode ?? error.code) === 409) {
+        await this.coreApi.patchNamespacedResourceQuota({
+          name: 'tenant-quota',
+          namespace,
+          body: { spec: quotaSpec },
+        });
       } else {
         throw error;
       }
@@ -675,7 +675,7 @@ export class ProvisioningService {
         },
       });
     } catch (error: any) {
-      if ((error.statusCode ?? error.response?.statusCode) === 409) {
+      if ((error.statusCode ?? error.response?.statusCode ?? error.code) === 409) {
         this.logger.warn(`Deployment already exists in ${namespace}, continuing...`);
       } else {
         throw error;
@@ -706,7 +706,7 @@ export class ProvisioningService {
         },
       });
     } catch (error: any) {
-      if ((error.statusCode ?? error.response?.statusCode) === 409) {
+      if ((error.statusCode ?? error.response?.statusCode ?? error.code) === 409) {
         this.logger.warn(`Service already exists in ${namespace}, continuing...`);
       } else {
         throw error;
@@ -755,8 +755,19 @@ export class ProvisioningService {
         },
       });
     } catch (error: any) {
-      if ((error.statusCode ?? error.response?.statusCode) === 409) {
-        this.logger.warn(`Ingress already exists in ${namespace}, continuing...`);
+      if ((error.statusCode ?? error.response?.statusCode ?? error.code) === 409) {
+        // Patch the group.name annotation so retries move the ingress to the current ALB group
+        await this.networkingApi.patchNamespacedIngress({
+          name: 'betterdb',
+          namespace,
+          body: {
+            metadata: {
+              annotations: {
+                'alb.ingress.kubernetes.io/group.name': this.albGroupName,
+              },
+            },
+          },
+        });
       } else {
         throw error;
       }
@@ -891,7 +902,7 @@ export class ProvisioningService {
         },
       });
     } catch (error: any) {
-      if ((error.statusCode ?? error.response?.statusCode) === 409) {
+      if ((error.statusCode ?? error.response?.statusCode ?? error.code) === 409) {
         this.logger.warn(`NetworkPolicy already exists in ${namespace}, continuing...`);
       } else {
         throw error;

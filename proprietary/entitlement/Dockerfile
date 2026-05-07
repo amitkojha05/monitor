@@ -47,6 +47,7 @@ WORKDIR /app
 # Copy everything we need from builder
 COPY --from=builder /app/node_modules ./node_modules
 COPY --from=builder /app/proprietary/entitlement/node_modules ./proprietary/entitlement/node_modules
+COPY --from=builder /app/packages/shared/node_modules ./packages/shared/node_modules
 COPY --from=builder /app/proprietary/entitlement/dist ./proprietary/entitlement/dist
 COPY --from=builder /app/proprietary/entitlement/prisma ./proprietary/entitlement/prisma
 COPY --from=builder /app/packages/shared/dist ./packages/shared/dist
