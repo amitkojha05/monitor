@@ -1,5 +1,5 @@
 import { useState, useRef, useEffect } from 'react';
-import type { MigrationAnalysisResult, MigrationExecutionResult, ExecutionMode } from '@betterdb/shared';
+import type { MigrationAnalysisResult, MigrationExecutionResult, ExecutionMode, RedisShakeOptions } from '@betterdb/shared';
 import { Feature } from '@betterdb/shared';
 import { fetchApi } from '../api/client';
 import { useLicense } from '../hooks/useLicense';
@@ -87,6 +87,8 @@ export function MigrationPage() {
   const blockingCount = job?.blockingCount ?? 0;
   const [executionMode, setExecutionMode] = useState<ExecutionMode>('command');
   const [preferReplica, setPreferReplica] = useState<boolean>(false);
+  const [tryDiskless, setTryDiskless] = useState<boolean>(false);
+  const [emptyDbBeforeSync, setEmptyDbBeforeSync] = useState<boolean>(false);
 
   // Issue 1 + 4: confirmation dialog state
   const [showConfirmDialog, setShowConfirmDialog] = useState(false);
@@ -118,6 +120,8 @@ export function MigrationPage() {
     setValidationId(null);
     setExecutionResult(null);
     setPreferReplica(false);
+    setTryDiskless(false);
+    setEmptyDbBeforeSync(false);
   };
 
   // Issue 1: open dialog instead of window.confirm
@@ -131,6 +135,11 @@ export function MigrationPage() {
     if (!job?.sourceConnectionId || !job?.targetConnectionId) return;
     setMigrationStarting(true);
     try {
+      const rsOptions: RedisShakeOptions = {};
+      if (tryDiskless) rsOptions.tryDiskless = true;
+      if (emptyDbBeforeSync) rsOptions.emptyDbBeforeSync = true;
+      const hasRsOptions = Object.keys(rsOptions).length > 0;
+
       const result = await fetchApi<{ id: string }>('/migration/execution', {
         method: 'POST',
         body: JSON.stringify({
@@ -140,6 +149,7 @@ export function MigrationPage() {
           ...(executionMode === 'redis_shake_sync' && {
             syncReaderOptions: { preferReplica },
           }),
+          ...(hasRsOptions && { redisShakeOptions: rsOptions }),
         }),
       });
       setShowConfirmDialog(false);
@@ -264,6 +274,30 @@ export function MigrationPage() {
                     className="rounded"
                   />
                   <span>Read from replica (recommended for production: avoids extra PSYNC load on the primary)</span>
+                </label>
+              </div>
+            )}
+
+            {(executionMode === 'redis_shake' || executionMode === 'redis_shake_sync') && canExecute && (
+              <div className="space-y-2 pt-1">
+                <p className="text-xs font-medium text-muted-foreground uppercase tracking-wide">RedisShake options</p>
+                <label className="flex items-center gap-2 text-sm">
+                  <input
+                    type="checkbox"
+                    checked={tryDiskless}
+                    onChange={(e) => setTryDiskless(e.target.checked)}
+                    className="rounded"
+                  />
+                  <span>Diskless RDB transfer <span className="text-muted-foreground">(source streams RDB over TCP, no disk write — recommended for large datasets)</span></span>
+                </label>
+                <label className="flex items-center gap-2 text-sm">
+                  <input
+                    type="checkbox"
+                    checked={emptyDbBeforeSync}
+                    onChange={(e) => setEmptyDbBeforeSync(e.target.checked)}
+                    className="rounded"
+                  />
+                  <span>Flush target before migration <span className="text-muted-foreground">(prevents BUSYKEY errors if the target already has data)</span></span>
                 </label>
               </div>
             )}

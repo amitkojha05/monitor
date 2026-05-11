@@ -1,4 +1,4 @@
-import type { DatabaseConnectionConfig, SyncReaderOptions } from '@betterdb/shared';
+import type { DatabaseConnectionConfig, RedisShakeOptions, SyncReaderOptions } from '@betterdb/shared';
 
 // eslint-disable-next-line no-control-regex
 const CONTROL_CHAR_RE = /[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/;
@@ -47,6 +47,7 @@ export function buildScanReaderToml(
   target: DatabaseConnectionConfig,
   sourceIsCluster: boolean,
   targetIsCluster: boolean = false,
+  rsOptions: RedisShakeOptions = {},
 ): string {
   const srcHost = validateHost(source.host);
   const srcPort = validatePort(source.port);
@@ -82,6 +83,8 @@ tls = ${target.tls ? 'true' : 'false'}
 
 [advanced]
 log_level = "info"
+pipeline_count_limit = 256
+try_diskless = ${rsOptions.tryDiskless ? 'true' : 'false'}
 `;
 
   return toml;
@@ -93,6 +96,7 @@ export function buildSyncReaderToml(
   sourceIsCluster: boolean,
   options: SyncReaderOptions = {},
   targetIsCluster: boolean = false,
+  rsOptions: RedisShakeOptions = {},
 ): string {
   const srcHost = validateHost(source.host);
   const srcPort = validatePort(source.port);
@@ -127,6 +131,8 @@ tls = ${target.tls ? 'true' : 'false'}
 
 [advanced]
 log_level = "info"
+pipeline_count_limit = 256
+try_diskless = ${rsOptions.tryDiskless ? 'true' : 'false'}
 `;
 
   return toml;

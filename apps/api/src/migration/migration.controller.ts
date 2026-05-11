@@ -91,6 +91,18 @@ export class MigrationController {
         throw new BadRequestException('syncReaderOptions.preferReplica must be a boolean');
       }
     }
+
+    if (body.redisShakeOptions !== undefined) {
+      if (typeof body.redisShakeOptions !== 'object' || body.redisShakeOptions === null) {
+        throw new BadRequestException('redisShakeOptions must be an object');
+      }
+      for (const field of ['tryDiskless', 'emptyDbBeforeSync'] as const) {
+        if (body.redisShakeOptions[field] !== undefined && typeof body.redisShakeOptions[field] !== 'boolean') {
+          throw new BadRequestException(`redisShakeOptions.${field} must be a boolean`);
+        }
+      }
+    }
+
     return this.executionService.startExecution(body);
   }
 

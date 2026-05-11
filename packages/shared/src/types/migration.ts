@@ -129,12 +129,33 @@ export interface SyncReaderOptions {
  */
 export type SyncStage = 'connecting' | 'rdb_syncing' | 'aof_replicating' | null;
 
+/**
+ * Options that apply to all RedisShake-based modes (redis_shake and redis_shake_sync).
+ * Ignored for command mode.
+ */
+export interface RedisShakeOptions {
+  /**
+   * Source streams the RDB directly over TCP without writing it to disk first.
+   * Eliminates the need for free disk space equal to the dataset size on the source.
+   * Recommended for large datasets (>10 GB per shard). Default: false.
+   */
+  tryDiskless?: boolean;
+  /**
+   * Flush the target before migration starts.
+   * Eliminates BUSYKEY errors when the target already contains data.
+   * Default: false.
+   */
+  emptyDbBeforeSync?: boolean;
+}
+
 export interface MigrationExecutionRequest {
   sourceConnectionId: string;
   targetConnectionId: string;
   mode?: ExecutionMode; // default 'redis_shake'
   /** Only honoured when mode === 'redis_shake_sync'. */
   syncReaderOptions?: SyncReaderOptions;
+  /** Honoured for redis_shake and redis_shake_sync modes. */
+  redisShakeOptions?: RedisShakeOptions;
 }
 
 export interface MigrationExecutionResult {
