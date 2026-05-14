@@ -22,6 +22,8 @@ export enum WebhookEventType {
   MONITOR_SESSION_STARTED = 'monitor.session.started',
   MONITOR_SESSION_COMPLETED = 'monitor.session.completed',
   MONITOR_SESSION_TRUNCATED = 'monitor.session.truncated',
+  MONITOR_SESSION_SKIPPED = 'monitor.session.skipped',
+  MONITOR_TRIGGER_CREATED = 'monitor.trigger.created',
 }
 
 // Injection tokens for proprietary webhook services
@@ -37,6 +39,7 @@ export const FREE_EVENTS: WebhookEventType[] = [
   WebhookEventType.MONITOR_SESSION_STARTED,
   WebhookEventType.MONITOR_SESSION_COMPLETED,
   WebhookEventType.MONITOR_SESSION_TRUNCATED,
+  WebhookEventType.MONITOR_SESSION_SKIPPED,
 ];
 
 export const PRO_EVENTS: WebhookEventType[] = [
@@ -51,6 +54,7 @@ export const PRO_EVENTS: WebhookEventType[] = [
   WebhookEventType.FAILOVER_STARTED,
   WebhookEventType.FAILOVER_COMPLETED,
   WebhookEventType.INFERENCE_SLA_BREACH,
+  WebhookEventType.MONITOR_TRIGGER_CREATED,
 ];
 
 export const ENTERPRISE_EVENTS: WebhookEventType[] = [
@@ -83,6 +87,7 @@ export const WEBHOOK_EVENT_TIERS: Record<WebhookEventType, Tier> = {
   [WebhookEventType.MONITOR_SESSION_STARTED]: Tier.community,
   [WebhookEventType.MONITOR_SESSION_COMPLETED]: Tier.community,
   [WebhookEventType.MONITOR_SESSION_TRUNCATED]: Tier.community,
+  [WebhookEventType.MONITOR_SESSION_SKIPPED]: Tier.community,
 
   // Pro tier events
   [WebhookEventType.ANOMALY_DETECTED]: Tier.pro,
@@ -95,6 +100,7 @@ export const WEBHOOK_EVENT_TIERS: Record<WebhookEventType, Tier> = {
   [WebhookEventType.FAILOVER_STARTED]: Tier.pro,
   [WebhookEventType.FAILOVER_COMPLETED]: Tier.pro,
   [WebhookEventType.INFERENCE_SLA_BREACH]: Tier.pro,
+  [WebhookEventType.MONITOR_TRIGGER_CREATED]: Tier.pro,
 
   // Enterprise tier events
   [WebhookEventType.AUDIT_POLICY_VIOLATION]: Tier.enterprise,
