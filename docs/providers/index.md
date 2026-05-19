@@ -11,7 +11,8 @@ BetterDB works with any Redis-compatible managed service. These guides cover pro
 | Provider | Protocol | TLS | Connection method |
 |----------|----------|-----|-------------------|
 | [Upstash](upstash) | Redis/Valkey | Required | Direct |
+| [Redis Cloud](redis-cloud) | Redis | Optional (plan-dependent) | Direct |
 | [AWS ElastiCache](aws-elasticache) | Redis/Valkey | Optional (required on Serverless) | Agent via EC2 |
 | [AWS MemoryDB](aws-memorydb) | Redis | Required | Agent via EC2 |
 
-> AWS services (ElastiCache, MemoryDB) are VPC-only and require the [BetterDB Agent](../agent-connection) running on an EC2 instance inside the same VPC. Upstash and other providers with public endpoints support direct connection.
+> AWS services (ElastiCache, MemoryDB) are VPC-only and require the [BetterDB Agent](../agent-connection) running on an EC2 instance inside the same VPC. Upstash, Redis Cloud, and other providers with public endpoints support direct connection.
