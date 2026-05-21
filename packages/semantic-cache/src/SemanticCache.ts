@@ -405,6 +405,7 @@ export class SemanticCache {
           | 'timeout_accept' | 'timeout_reject';
         let decision: JudgeDecision;
 
+        const judgeController = new AbortController();
         try {
           const accepted = await raceWithTimeout(
             options.judge.judgeFn({
@@ -413,11 +414,14 @@ export class SemanticCache {
               similarity: winnerScore,
               threshold,
               category: category || undefined,
+              signal: judgeController.signal,
             }),
             timeoutMs,
+            () => judgeController.abort(),
           );
           decision = accepted ? 'accept' : 'reject';
         } catch (err) {
+          // raceWithTimeout already aborted the controller on the timeout path.
           const isTimeout = err instanceof JudgeTimeoutError;
           if (onError === 'accept') {
             decision = isTimeout ? 'timeout_accept' : 'error_accept';
@@ -1559,10 +1563,17 @@ class JudgeTimeoutError extends Error {
   }
 }
 
-function raceWithTimeout<T>(p: Promise<T>, timeoutMs: number): Promise<T> {
+function raceWithTimeout<T>(
+  p: Promise<T>,
+  timeoutMs: number,
+  onTimeout?: () => void,
+): Promise<T> {
   let timer!: ReturnType<typeof setTimeout>;
   const timeout = new Promise<never>((_, reject) => {
-    timer = setTimeout(() => reject(new JudgeTimeoutError()), timeoutMs);
+    timer = setTimeout(() => {
+      onTimeout?.();
+      reject(new JudgeTimeoutError());
+    }, timeoutMs);
   });
   return Promise.race([p, timeout]).finally(() => clearTimeout(timer));
 }
