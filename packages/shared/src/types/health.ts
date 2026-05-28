@@ -22,6 +22,30 @@ export interface RuntimeCapabilities {
   canMemory: boolean;
 }
 
+/** Reason a runtime capability is disabled and when it was disabled (ms epoch). */
+export interface RuntimeCapabilityDisabledInfo {
+  reason: string;
+  disabledAt: number;
+}
+
+/** Map of capability key → disabled-reason. Capabilities that are still
+ *  available are omitted, so the absence of a key means "fine". */
+export type RuntimeCapabilityReasons = Partial<
+  Record<keyof RuntimeCapabilities, RuntimeCapabilityDisabledInfo>
+>;
+
+/**
+ * Verdict returned by POST /connections/:id/capabilities/:capability/retry.
+ * `available: 'unknown'` means the probe failed for a transient reason
+ * (network blip, timeout, connection reset) — the prior capability state
+ * is preserved and the operator should try again rather than treat it as
+ * a definitive answer.
+ */
+export interface CapabilityRetryVerdict {
+  available: boolean | 'unknown';
+  reason?: string;
+}
+
 export interface HealthResponse {
   status: 'connected' | 'disconnected' | 'error' | 'waiting';
   database: {
@@ -32,6 +56,7 @@ export interface HealthResponse {
   };
   capabilities: DatabaseCapabilities | null;
   runtimeCapabilities?: RuntimeCapabilities | null;
+  runtimeCapabilityReasons?: RuntimeCapabilityReasons;
   error?: string;
   message?: string;
 }

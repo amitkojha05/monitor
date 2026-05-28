@@ -1,6 +1,11 @@
 import { Controller, Get, Post, Delete, Param, Body, HttpException, HttpStatus } from '@nestjs/common';
 import { ApiTags, ApiOperation, ApiResponse, ApiParam } from '@nestjs/swagger';
+import { CapabilityRetryVerdict, RuntimeCapabilities } from '@betterdb/shared';
 import { ConnectionRegistry } from './connection-registry.service';
+import {
+  CAPABILITY_TEST_COMMAND,
+  RuntimeCapabilityTracker,
+} from './runtime-capability-tracker.service';
 import {
   CreateConnectionDto,
   ConnectionListResponseDto,
@@ -10,10 +15,54 @@ import {
   SuccessResponseDto,
 } from '../common/dto/connections.dto';
 
+const RUNTIME_CAPABILITY_KEYS = Object.keys(
+  CAPABILITY_TEST_COMMAND,
+) as ReadonlyArray<keyof RuntimeCapabilities>;
+
+function isRuntimeCapabilityKey(value: string): value is keyof RuntimeCapabilities {
+  return RUNTIME_CAPABILITY_KEYS.includes(value as keyof RuntimeCapabilities);
+}
+
+/**
+ * Hard ceiling on a capability-probe call. iovalkey configures its own
+ * `commandTimeout`, but adapters that lack one (or that get stuck before a
+ * command is even queued — TLS hand-shaking on a dead server, etc.) would
+ * otherwise pin the retry endpoint forever. On timeout the probe yields
+ * `available: 'unknown'` and the prior capability state is preserved.
+ */
+const CAPABILITY_PROBE_TIMEOUT_MS = 5000;
+
+function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      reject(new Error(`Probe timed out after ${ms}ms`));
+    }, ms);
+    promise.then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (err) => {
+        clearTimeout(timer);
+        reject(err);
+      },
+    );
+  });
+}
+
 @ApiTags('connections')
 @Controller('connections')
 export class ConnectionsController {
-  constructor(private readonly registry: ConnectionRegistry) {}
+  // Per-(connection, capability) in-flight probe. The underlying iovalkey
+  // `call` cannot be cancelled when our 5s ceiling fires, so we dedupe
+  // repeated retry requests onto the same outstanding command instead of
+  // stacking new ones on the server.
+  private readonly inflightProbes = new Map<string, Promise<unknown>>();
+
+  constructor(
+    private readonly registry: ConnectionRegistry,
+    private readonly capabilityTracker: RuntimeCapabilityTracker,
+  ) {}
 
   @Get()
   @ApiOperation({
@@ -107,6 +156,61 @@ export class ConnectionsController {
         error instanceof Error ? error.message : 'Failed to reconnect',
         HttpStatus.BAD_REQUEST,
       );
+    }
+  }
+
+  @Post(':id/capabilities/:capability/retry')
+  @ApiOperation({
+    summary: 'Force a synchronous probe of a runtime capability',
+    description:
+      'Runs the capability\'s test command against the live server and returns the verdict (`available: true` / `false` / `"unknown"`). On success the capability is re-enabled; on a definitive rejection it stays (or becomes) disabled with the fresh reason; on transient errors the previous state is preserved.',
+  })
+  @ApiParam({ name: 'id', description: 'Connection ID' })
+  @ApiParam({
+    name: 'capability',
+    description: 'Runtime capability key (e.g. canSlowLog, canCommandLog, canLatency)',
+  })
+  @ApiResponse({ status: 200, description: 'Probe completed; see body for verdict' })
+  @ApiResponse({ status: 400, description: 'Unknown capability key' })
+  @ApiResponse({ status: 404, description: 'Connection not found' })
+  async retryCapability(
+    @Param('id') id: string,
+    @Param('capability') capability: string,
+  ): Promise<CapabilityRetryVerdict> {
+    if (!isRuntimeCapabilityKey(capability)) {
+      throw new HttpException(`Unknown capability: ${capability}`, HttpStatus.BAD_REQUEST);
+    }
+    const config = this.registry.getConfig(id);
+    if (!config) {
+      throw new HttpException(`Connection ${id} not found`, HttpStatus.NOT_FOUND);
+    }
+    const adapter = this.registry.get(id);
+    const [command, ...args] = CAPABILITY_TEST_COMMAND[capability];
+    const probeKey = `${id}:${capability}`;
+    let probe = this.inflightProbes.get(probeKey);
+    if (!probe) {
+      probe = adapter.call(command, args).finally(() => {
+        if (this.inflightProbes.get(probeKey) === probe) {
+          this.inflightProbes.delete(probeKey);
+        }
+      });
+      this.inflightProbes.set(probeKey, probe);
+    }
+    try {
+      await withTimeout(probe, CAPABILITY_PROBE_TIMEOUT_MS);
+      this.capabilityTracker.resetCapability(id, capability);
+      return { available: true };
+    } catch (error) {
+      const wasBlocked = this.capabilityTracker.recordFailure(
+        id,
+        capability,
+        error instanceof Error ? error : String(error),
+      );
+      const reason = error instanceof Error ? error.message : String(error);
+      if (wasBlocked) {
+        return { available: false, reason };
+      }
+      return { available: 'unknown', reason };
     }
   }
 

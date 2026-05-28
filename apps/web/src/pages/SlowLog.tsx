@@ -12,7 +12,7 @@ import { SlowLogTable } from '../components/metrics/SlowLogTable';
 import { CommandLogTable } from '../components/metrics/CommandLogTable';
 import { SlowLogPatternAnalysisView } from '../components/metrics/SlowLogPatternAnalysis';
 import { DateRangePicker, DateRange } from '../components/ui/date-range-picker';
-import { UnavailableOverlay } from '../components/UnavailableOverlay';
+import { CapabilityStatusBanner } from '../components/CapabilityStatusBanner';
 import type { CommandLogType } from '../types/metrics';
 
 function getTabFromParams(params: URLSearchParams): CommandLogType {
@@ -38,7 +38,15 @@ function filterByClient<T extends { clientName: string; clientAddress: string }>
 
 export function SlowLog() {
   const { currentConnection } = useConnection();
-  const { hasCommandLog, hasSlowLog, capabilities } = useCapabilities();
+  const { hasCommandLog, hasSlowLog, capabilities, reasons, retryCapability } = useCapabilities();
+  const slowLogReason = reasons.canSlowLog;
+  const commandLogReason = reasons.canCommandLog;
+  const handleRetrySlowLog = retryCapability
+    ? () => retryCapability('canSlowLog')
+    : undefined;
+  const handleRetryCommandLog = retryCapability
+    ? () => retryCapability('canCommandLog')
+    : undefined;
   const [searchParams, setSearchParams] = useSearchParams();
   const activeTab = getTabFromParams(searchParams);
   const clientFilter = searchParams.get('client');
@@ -202,7 +210,16 @@ export function SlowLog() {
     setSearchParams(searchParams);
   };
 
-  const slowLogUnavailable = !hasSlowLog && !hasCommandLog;
+  // Render a banner per missing capability so each retry targets the right
+  // probe. A banner without a reason means the server genuinely doesn't expose
+  // the capability (e.g. Redis lacks COMMANDLOG) — for that we only surface a
+  // banner when BOTH are missing, so we never spam "COMMANDLOG not exposed"
+  // on every Redis SlowLog page.
+  const bothMissing = !hasSlowLog && !hasCommandLog;
+  const showSlowLogBanner = !hasSlowLog && (Boolean(slowLogReason) || bothMissing);
+  const showCommandLogBanner = !hasCommandLog && (Boolean(commandLogReason) || bothMissing);
+  const FALLBACK_REASON = 'Not exposed by this server.';
+
   const content = (
     <div className="space-y-6">
       <div className="flex items-center justify-between">
@@ -234,6 +251,25 @@ export function SlowLog() {
           </span>
         )}
       </div>
+
+      {showSlowLogBanner && (
+        <CapabilityStatusBanner
+          key={`slowlog-${currentConnection?.id ?? 'none'}`}
+          featureName="Slow Log"
+          command="SLOWLOG"
+          reason={slowLogReason?.reason ?? FALLBACK_REASON}
+          onRetry={slowLogReason ? handleRetrySlowLog : undefined}
+        />
+      )}
+      {showCommandLogBanner && (
+        <CapabilityStatusBanner
+          key={`commandlog-${currentConnection?.id ?? 'none'}`}
+          featureName="Command Log"
+          command="COMMANDLOG"
+          reason={commandLogReason?.reason ?? FALLBACK_REASON}
+          onRetry={commandLogReason ? handleRetryCommandLog : undefined}
+        />
+      )}
 
       {hasCommandLog ? (
         <Card>
@@ -326,14 +362,6 @@ export function SlowLog() {
       )}
     </div>
   );
-
-  if (slowLogUnavailable) {
-    return (
-      <UnavailableOverlay featureName="Slow Log" command="SLOWLOG/COMMANDLOG">
-        {content}
-      </UnavailableOverlay>
-    );
-  }
 
   return content;
 }
