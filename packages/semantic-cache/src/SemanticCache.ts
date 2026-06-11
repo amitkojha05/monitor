@@ -373,7 +373,7 @@ export class SemanticCache {
           .filter(({ s }) => !isNaN(s))
           .map(({ i, s }) => ({
             origIdx: i,
-            candidate: { response: parsed[i].fields['response'] ?? '', similarity: s },
+            candidate: { response: parsed[i].fields['response'] ?? '', similarity: s, prompt: parsed[i].fields['prompt'] ?? '' },
           }));
         const picked = await rerankOpts.rerankFn(
           promptText,
@@ -453,6 +453,8 @@ export class SemanticCache {
               similarity: winnerScore,
               threshold,
               category: category || undefined,
+              // Reserved for consumer judge functions; not consumed by the built-in judge path.
+              cachedPrompt: winner.fields['prompt'] ?? '',
             }),
             timeoutMs,
           );
