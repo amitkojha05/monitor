@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.5.0] - 2026-06-11
+
+### Added
+
+- **Built-in keyword-overlap rerank factory** — `create_keyword_overlap_rerank()` returns a rerank function that blends cosine similarity with word overlap. Supports `compare="prompt"` (equivalence signal, default) and `compare="response"` (relevance signal), with configurable `cosine_weight`.
+- **Stored prompt exposed on rerank candidates** — rerank candidates now include a `prompt` key with the stored prompt text (additive).
+- **`cached_prompt` in judge context** — the judge context now carries the stored prompt text alongside the response (reserved, inert by default).
+
 ## [0.4.0] - 2026-05-15
 
 ### Added

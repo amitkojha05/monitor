@@ -5,6 +5,19 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.0] - 2026-06-11
+
+### Added
+
+- **Built-in keyword-overlap rerank factory** — `createKeywordOverlapRerank()` returns a rerank function that blends cosine similarity with word overlap. Supports `compare: 'prompt'` (equivalence signal, default) and `compare: 'response'` (relevance signal), with configurable `cosineWeight`.
+- **Stored prompt exposed on rerank candidates** — rerank candidates now include a `prompt` key with the stored prompt text (additive).
+- **`cachedPrompt` in judge context** — the judge context now carries the stored prompt text alongside the response (reserved, inert by default).
+- **Cost instrumentation** — similarity-window entries now record `cost_saved_micros` for hits, and a subsequent `store()` retroactively populates the cost of the preceding miss. Consumed by BetterDB Monitor's cost-weighted threshold recommendations.
+
+### Fixed
+
+- **Miss-pending zset is pruned and flushed** — entries older than the 5-minute bound are pruned on every record, so miss-only traffic cannot grow the bookkeeping zset unbounded; `flush()` now deletes the miss-pending key alongside stats and window keys.
+
 ## [0.5.0] - 2026-05-13
 
 ### Added
