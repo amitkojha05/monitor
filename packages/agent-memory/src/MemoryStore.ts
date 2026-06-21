@@ -89,7 +89,11 @@ export class MemoryStore {
         continue;
       }
       const item = parseMemoryItem(this.name, hit);
-      const ageSeconds = (now - item.createdAt) / 1000;
+      // Recency decays from the last access, not creation, so reinforcement
+      // (which bumps last_accessed_at) actually makes a memory more recallable.
+      // max() guards against a clock-skewed last_accessed_at older than created_at.
+      const lastTouched = Math.max(item.createdAt, item.lastAccessedAt);
+      const ageSeconds = (now - lastTouched) / 1000;
       const score = compositeScore({
         similarity: similarityFromDistance(distance),
         ageSeconds,
@@ -104,7 +108,27 @@ export class MemoryStore {
     }
 
     hits.sort((a, b) => b.score - a.score);
-    return hits.slice(0, k);
+    const result = hits.slice(0, k);
+
+    if (options.reinforce !== false) {
+      // Reinforcement is best-effort and must never break the recall read path.
+      await this.reinforce(result, now).catch(() => undefined);
+    }
+    return result;
+  }
+
+  private async reinforce(hits: MemoryHit[], now: number): Promise<void> {
+    for (const hit of hits) {
+      const key = `${this.name}:mem:${hit.item.id}`;
+      // Only touch live hashes: a recalled key may already be deleted (stale
+      // index) and HSET/HINCRBY would otherwise resurrect a partial record.
+      const exists = Number(await this.client.call('EXISTS', key));
+      if (exists === 0) {
+        continue;
+      }
+      await this.client.call('HSET', key, 'last_accessed_at', String(now));
+      await this.client.call('HINCRBY', key, 'access_count', '1');
+    }
   }
 
   async forget(id: string): Promise<boolean> {
