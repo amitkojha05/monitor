@@ -4,6 +4,7 @@ import { buildMemoryRecord } from './buildMemoryRecord';
 import { buildRecallQuery, buildScopeFilter, SCORE_FIELD } from './buildRecallQuery';
 import { parseMemoryItem } from './parseMemoryItem';
 import { compositeScore, similarityFromDistance, type RecallWeights } from './compositeScore';
+import { selectEvictions, type EvictionCandidate } from './selectEvictions';
 import type {
   EmbedFn,
   MemoryHit,
@@ -20,6 +21,7 @@ const DEFAULT_RECALL_K = 8;
 const RECALL_OVERFETCH = 4;
 const FORGET_BATCH_SIZE = 500;
 const FORGET_MAX_BATCHES = 10000;
+const EVICTION_SCAN_LIMIT = 10000;
 
 export interface MemoryStoreOptions {
   client: MemoryStoreClient;
@@ -28,6 +30,7 @@ export interface MemoryStoreOptions {
   defaultThreshold?: number;
   weights?: RecallWeights;
   halfLifeSeconds?: number;
+  maxItemsPerScope?: number;
 }
 
 export class MemoryStore {
@@ -37,6 +40,7 @@ export class MemoryStore {
   private readonly defaultThreshold: number;
   private readonly weights: RecallWeights;
   private readonly halfLifeSeconds: number;
+  private readonly maxItemsPerScope?: number;
   private dims?: number;
 
   constructor(options: MemoryStoreOptions) {
@@ -46,6 +50,7 @@ export class MemoryStore {
     this.defaultThreshold = options.defaultThreshold ?? DEFAULT_THRESHOLD;
     this.weights = options.weights ?? DEFAULT_WEIGHTS;
     this.halfLifeSeconds = options.halfLifeSeconds ?? DEFAULT_HALF_LIFE_SECONDS;
+    this.maxItemsPerScope = options.maxItemsPerScope;
   }
 
   async recall(query: string, options: RecallOptions = {}): Promise<MemoryHit[]> {
@@ -192,8 +197,110 @@ export class MemoryStore {
     const id = randomUUID();
     const now = Date.now();
     const record = buildMemoryRecord(this.name, id, content, vector, options, now);
-    await this.client.call('HSET', record.key, ...record.fields);
+    await this.writeRecord(record.key, record.fields, options.ttl);
+    // Capacity enforcement is best-effort: the memory is already durably stored,
+    // so a failed eviction pass must not reject an otherwise successful write.
+    await this.enforceCapacity(options, now).catch(() => undefined);
     return id;
+  }
+
+  private async writeRecord(key: string, fields: (string | Buffer)[], ttl?: number): Promise<void> {
+    if (ttl === undefined || ttl <= 0) {
+      await this.client.call('HSET', key, ...fields);
+      return;
+    }
+    // Set the hash and its expiry in one transaction so a crash between the two
+    // can't leave a memory that should expire living forever. Atomicity assumes
+    // the client routes these calls to a single connection (the MemoryStoreClient
+    // contract); on a pooled client that splits them the guarantee is lost.
+    await this.client.call('MULTI');
+    try {
+      await this.client.call('HSET', key, ...fields);
+      await this.client.call('EXPIRE', key, String(ttl));
+      await this.client.call('EXEC');
+    } catch (err) {
+      // Clear the half-built transaction so the connection isn't left mid-MULTI.
+      await this.client.call('DISCARD').catch(() => undefined);
+      throw err;
+    }
+  }
+
+  private async enforceCapacity(scope: MemoryScope & { tags?: string[] }, now: number): Promise<void> {
+    const max = this.maxItemsPerScope;
+    if (max === undefined) {
+      return;
+    }
+    // Tags are part of the partition (as in recall/forgetByScope), so a
+    // tag-scoped write caps its own tag bucket.
+    const filter = buildScopeFilter(scope, scope.tags ?? []);
+    if (filter === '*') {
+      // A fully-unscoped write has no scope to bound: enforcing here would count
+      // and evict across the entire index (every other scope's memories), which
+      // `maxItemsPerScope` does not promise. Skip — the write stays, uncapped.
+      return;
+    }
+    // Count-first so the common in-capacity write pays only a cheap LIMIT 0 0
+    // probe and never fetches candidate rows. Both the count and the candidate
+    // scan go through FT.SEARCH, so under HNSW index lag the cap is enforced
+    // approximately and up to one write behind (the unit tests mock this exact).
+    const countRaw = await this.client.call(
+      'FT.SEARCH',
+      `${this.name}:mem:idx`,
+      filter,
+      'LIMIT',
+      '0',
+      '0',
+      'DIALECT',
+      '2',
+    );
+    const total = ftSearchTotal(countRaw);
+    if (total <= max) {
+      return;
+    }
+
+    // Eviction selection is exact while the scope fits EVICTION_SCAN_LIMIT (the
+    // expected case); a larger scope evicts from the scanned window and the
+    // remainder is reclaimed on subsequent writes.
+
+    const raw = await this.client.call(
+      'FT.SEARCH',
+      `${this.name}:mem:idx`,
+      filter,
+      'RETURN',
+      '2',
+      'importance',
+      'last_accessed_at',
+      'LIMIT',
+      '0',
+      String(EVICTION_SCAN_LIMIT),
+      'DIALECT',
+      '2',
+    );
+    const candidates: EvictionCandidate[] = parseFtSearchResponse(raw).map((hit) => {
+      const importance = Number(hit.fields.importance);
+      const lastAccessedAt = Number(hit.fields.last_accessed_at);
+      return {
+        key: hit.key,
+        importance: Number.isFinite(importance) ? importance : 0,
+        lastAccessedAt: Number.isFinite(lastAccessedAt) ? lastAccessedAt : 0,
+      };
+    });
+    const dropCount = Math.min(total - max, candidates.length);
+    const evictKeys = selectEvictions(candidates, candidates.length - dropCount, {
+      now,
+      halfLifeSeconds: this.halfLifeSeconds,
+      weights: this.weights,
+    });
+    if (evictKeys.length === 0) {
+      return;
+    }
+    await this.client.call('DEL', ...evictKeys);
+    await this.client.call(
+      'HINCRBY',
+      `${this.name}:__mem_stats`,
+      'evictions',
+      String(evictKeys.length),
+    );
   }
 
   private async embed(content: string): Promise<number[]> {
@@ -207,4 +314,12 @@ export class MemoryStore {
     }
     return vector;
   }
+}
+
+function ftSearchTotal(raw: unknown): number {
+  if (!Array.isArray(raw) || raw.length < 1) {
+    return 0;
+  }
+  const total = typeof raw[0] === 'string' ? parseInt(raw[0], 10) : Number(raw[0]);
+  return Number.isFinite(total) && total > 0 ? total : 0;
 }
