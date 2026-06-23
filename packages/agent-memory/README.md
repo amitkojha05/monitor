@@ -73,6 +73,8 @@ await memory.ensureIndex();
 
 Recall ranks by `compositeScore` — a weighted blend of similarity, recency (true half-life decay), and importance. Defaults are tunable via `MemoryStoreOptions` (`weights`, `halfLifeSeconds`, `defaultThreshold`) or live via config refresh. Set `maxItemsPerScope` to cap memories per scope; over-capacity writes evict the lowest-scoring items (importance + recency).
 
+`recall` only returns candidates whose cosine **distance** is within a threshold (default `0.25`, i.e. similarity ≥ ~0.875) — tuned for real semantic embeddings, where a relevant memory lands well inside it. A weak or non-semantic `embedFn` can push every candidate past the threshold and yield no hits; raise it per call (`recall(query, { threshold })`) or globally (`defaultThreshold`) if that happens.
+
 ## Observability
 
 Set `telemetry: { registry }` to register Prometheus metrics (`agent_memory_*`: items, recall total/hits/empty/latency, embedding calls, evictions, consolidations) and OpenTelemetry spans for each operation. With `discovery` enabled (default in the facade), the store publishes a marker to the shared `__betterdb:caches` registry so Monitor can auto-discover it.
