@@ -24,6 +24,12 @@ import {
   type MemoryTelemetry,
   type MemoryTelemetryOptions,
 } from './telemetry';
+import {
+  createAnalytics,
+  NOOP_ANALYTICS,
+  type Analytics,
+  type AnalyticsOptions,
+} from './analytics';
 import type {
   ConsolidateOptions,
   ConsolidateResult,
@@ -95,6 +101,7 @@ export interface MemoryStoreOptions {
   discovery?: boolean | MemoryDiscoveryConfig;
   configRefresh?: boolean | MemoryConfigRefreshConfig;
   telemetry?: MemoryTelemetryOptions;
+  analytics?: AnalyticsOptions;
 }
 
 export class MemoryStore {
@@ -116,6 +123,9 @@ export class MemoryStore {
   private readonly telemetry: MemoryTelemetry;
   private readonly storeLabels: Record<string, string>;
   private dims?: number;
+  private readonly analyticsOptions?: AnalyticsOptions;
+  private analytics: Analytics = NOOP_ANALYTICS;
+  private analyticsStarted = false;
 
   constructor(options: MemoryStoreOptions) {
     this.client = options.client;
@@ -134,6 +144,32 @@ export class MemoryStore {
     this.configKey = `${this.name}:__mem_config`;
     this.discovery = this.createDiscovery(options.discovery);
     this.startConfigRefresh(options.configRefresh);
+    this.analyticsOptions = options.analytics;
+  }
+
+  // Fire-once: defer analytics startup to the first index-lifecycle call so the
+  // real client is awaited before any event is captured (the constructor cannot
+  // await). Never lets analytics break the memory store.
+  private async ensureAnalyticsStarted(): Promise<void> {
+    if (this.analyticsStarted) {
+      return;
+    }
+    this.analyticsStarted = true;
+    try {
+      const analytics = await createAnalytics({
+        apiKey: this.analyticsOptions?.apiKey,
+        host: this.analyticsOptions?.host,
+        disabled: this.analyticsOptions?.disabled,
+      });
+      this.analytics = analytics;
+      await analytics.init(this.client, this.name, {
+        hasEmbedFn: this.embedFn !== undefined,
+        maxItemsPerScope: this.maxItemsPerScope,
+        discovery: this.discovery !== null,
+      });
+    } catch {
+      this.analytics = NOOP_ANALYTICS;
+    }
   }
 
   currentConfig(): MemoryConfigSnapshot {
@@ -337,6 +373,7 @@ export class MemoryStore {
     if (this.discovery) {
       await this.discovery.stop({ deleteHeartbeat: true });
     }
+    await this.analytics.shutdown();
   }
 
   /**
@@ -347,6 +384,7 @@ export class MemoryStore {
    * initialize().
    */
   async ensureIndex(): Promise<void> {
+    await this.ensureAnalyticsStarted();
     try {
       await this.client.call('FT.INFO', memoryIndexName(this.name));
       return;
@@ -357,6 +395,7 @@ export class MemoryStore {
     }
     const dims = await this.resolveDims();
     await this.client.call('FT.CREATE', ...buildMemoryIndexArgs(this.name, dims));
+    this.analytics.capture('index_created', { dims });
   }
 
   async recall(query: string, options: RecallOptions = {}): Promise<MemoryHit[]> {

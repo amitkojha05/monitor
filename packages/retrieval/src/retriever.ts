@@ -18,6 +18,7 @@ import {
 } from './discovery';
 import { parsePercentIndexed, type IndexHealthSnapshot, type RecallEstimator } from './health';
 import type { RetrievalMetrics, RetrievalTracer, RetrievalOperation } from './telemetry';
+import { createAnalytics, NOOP_ANALYTICS, type Analytics, type AnalyticsOptions } from './analytics';
 
 // Atomic compare-and-set for the shared registry field. REGISTRY_KEY is keyed by
 // name and shared with agent-cache, so a plain HGET -> compare -> HSET/HDEL has a
@@ -91,6 +92,7 @@ export interface RetrieverOptions {
   recallEstimator?: RecallEstimator;
   metrics?: RetrievalMetrics;
   tracer?: RetrievalTracer;
+  analytics?: AnalyticsOptions;
 }
 
 export interface UpsertEntry {
@@ -110,6 +112,9 @@ export class Retriever {
   private readonly metrics?: RetrievalMetrics;
   private readonly tracer?: RetrievalTracer;
   private resolvedDims?: number;
+  private readonly analyticsOptions?: AnalyticsOptions;
+  private analytics: Analytics = NOOP_ANALYTICS;
+  private analyticsStarted = false;
 
   constructor(options: RetrieverOptions) {
     this.client = options.client;
@@ -121,6 +126,39 @@ export class Retriever {
     this.recallEstimator = options.recallEstimator;
     this.metrics = options.metrics;
     this.tracer = options.tracer;
+    this.analyticsOptions = options.analytics;
+  }
+
+  // Fire-once: defer analytics startup to the first index-lifecycle call so the
+  // real client is awaited before any event is captured (the constructor cannot
+  // await). Never lets analytics break the retriever.
+  private async ensureAnalyticsStarted(): Promise<void> {
+    if (this.analyticsStarted) {
+      return;
+    }
+    this.analyticsStarted = true;
+    try {
+      const analytics = await createAnalytics({
+        apiKey: this.analyticsOptions?.apiKey,
+        host: this.analyticsOptions?.host,
+        disabled: this.analyticsOptions?.disabled,
+      });
+      this.analytics = analytics;
+      await analytics.init(this.client, this.name, {
+        fieldCount: this.schema.fields.length,
+        vectorMetric: this.schema.vector.metric,
+        vectorAlgorithm: this.schema.vector.algorithm,
+        hasEmbedFn: this.embedFn !== undefined,
+        hasRerankFn: this.rerankFn !== undefined,
+      });
+    } catch {
+      this.analytics = NOOP_ANALYTICS;
+    }
+  }
+
+  /** Tear down product analytics (flushes any pending events). */
+  async close(): Promise<void> {
+    await this.analytics.shutdown();
   }
 
   private async instrument<T>(operation: RetrievalOperation, fn: () => Promise<T>): Promise<T> {
@@ -160,6 +198,7 @@ export class Retriever {
   }
 
   async createIndex(): Promise<void> {
+    await this.ensureAnalyticsStarted();
     try {
       await this.client.call('FT.INFO', indexName(this.name));
       return;
@@ -185,7 +224,11 @@ export class Retriever {
       if (!String(err).toLowerCase().includes('already exists')) {
         throw err;
       }
+      // This worker did not create the index — skip the telemetry event so a
+      // multi-worker boot does not over-count index creation.
+      return;
     }
+    this.analytics.capture('index_created', { dims });
   }
 
   private assertNoReservedFields(entry: UpsertEntry, vectorField: string): void {
