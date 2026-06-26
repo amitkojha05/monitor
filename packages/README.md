@@ -11,6 +11,17 @@ This directory contains the open-source packages that make up the BetterDB ecosy
 | [`agent-cache`](./agent-cache) | TypeScript | [npm: @betterdb/agent-cache](https://www.npmjs.com/package/@betterdb/agent-cache) | Multi-tier exact-match cache for AI agent workloads. Caches LLM responses, tool results, and session state with per-tool TTL policies and cost tracking. |
 | [`agent-cache-py`](./agent-cache-py) | Python | [PyPI: betterdb-agent-cache](https://pypi.org/project/betterdb-agent-cache/) | Python counterpart to `@betterdb/agent-cache`. |
 
+## Retrieval & memory
+
+| Package | Language | Registry | Description |
+|---|---|---|---|
+| [`valkey-search-kit`](./valkey-search-kit) | TypeScript | [npm: @betterdb/valkey-search-kit](https://www.npmjs.com/package/@betterdb/valkey-search-kit) | Shared low-level helpers for Valkey Search (`FT.*`): vector byte encoding, `FT.SEARCH`/`FT.INFO` reply parsing, TAG filter escaping, and error classification. No runtime dependencies. Foundation for the retrieval and agent-memory packages. |
+| [`valkey-search-kit-py`](./valkey-search-kit-py) | Python | [PyPI: betterdb-valkey-search-kit](https://pypi.org/project/betterdb-valkey-search-kit/) | Python counterpart to `@betterdb/valkey-search-kit`. |
+| [`retrieval`](./retrieval) | TypeScript | [npm: @betterdb/retrieval](https://www.npmjs.com/package/@betterdb/retrieval) | Developer-facing retrieval SDK over Valkey Search. Typed index schema, idempotent index lifecycle, upsert/delete, and vector + filtered + hybrid query. Built on `@betterdb/valkey-search-kit`. |
+| [`retrieval-py`](./retrieval-py) | Python | [PyPI: betterdb-retrieval](https://pypi.org/project/betterdb-retrieval/) | Python counterpart to `@betterdb/retrieval`. Same Valkey data format — a TypeScript app and a Python app can share the same index. |
+| [`agent-memory`](./agent-memory) | TypeScript | [npm: @betterdb/agent-memory](https://www.npmjs.com/package/@betterdb/agent-memory) | Long-term semantic memory for AI agents backed by Valkey Search, plus the short-term cache tiers from `@betterdb/agent-cache`. `remember()`/`recall()` with similarity blended with recency and importance, capacity eviction, and consolidation. |
+| [`agent-memory-py`](./agent-memory-py) | Python | [PyPI: betterdb-agent-memory](https://pypi.org/project/betterdb-agent-memory/) | Python counterpart to `@betterdb/agent-memory`. |
+
 ## Tools
 
 | Package | Language | Registry | Description |
