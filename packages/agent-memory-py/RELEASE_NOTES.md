@@ -1,8 +1,14 @@
-# betterdb-agent-memory v0.1.0
+# betterdb-agent-memory v0.2.0
 
-Python port of `@betterdb/agent-memory`. Long-term memory tier for AI agents
-backed by Valkey Search — semantic recall with recency/importance ranking,
-scoped capacity eviction, and consolidation. Pairs with `betterdb-agent-cache`.
+Long-term memory tier for AI agents backed by Valkey Search — semantic recall
+with recency/importance ranking, scoped capacity eviction, and consolidation.
+Pairs with `betterdb-agent-cache`.
+
+## What's new in v0.2.0
+
+- Opt-out anonymous usage analytics (PostHog). Disable with
+  `BETTERDB_TELEMETRY=false` (or `0`/`no`/`off`), or per-instance via options.
+  Instance id is an anonymous UUID persisted in Valkey; no payload data is sent.
 
 Requires Valkey 8+ with the **valkey-search** module (vector index support).
 Works with ElastiCache for Valkey, Memorystore for Valkey, and MemoryDB.
