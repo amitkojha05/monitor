@@ -903,6 +903,12 @@ export class ProvisioningService {
         },
       });
     } catch (error: any) {
+      // Preserve the original error when the namespace is gone so callers can
+      // detect it via isNotFoundError and skip (e.g. a deprovision retry after
+      // the namespace was already deleted). Wrapping would mask the 404 shape.
+      if (this.isNotFoundError(error)) {
+        throw error;
+      }
       throw new Error(`Failed to create ${jobName} job: ${error.message}`);
     }
 

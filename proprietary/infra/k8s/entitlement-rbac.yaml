@@ -29,6 +29,11 @@ rules:
   - apiGroups: ["apps"]
     resources: ["deployments", "statefulsets"]
     verbs: ["get", "list", "create", "update", "patch", "delete"]
+  # Scale subresource: deprovision scales the tenant app to zero to free the
+  # namespace ResourceQuota before running the schema-drop Job.
+  - apiGroups: ["apps"]
+    resources: ["deployments/scale", "statefulsets/scale"]
+    verbs: ["get", "update", "patch"]
   # Traefik IngressRouteTCP for public Valkey exposure (SNI routing)
   - apiGroups: ["traefik.io"]
     resources: ["ingressroutetcps"]
