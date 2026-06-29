@@ -42,10 +42,11 @@ rules:
   - apiGroups: ["batch"]
     resources: ["jobs"]
     verbs: ["get", "list", "create", "delete"]
-  # Ingress management
+  # Ingress management. patch/update are required because provisioning sets the
+  # ALB group annotation on the ingress after creating it.
   - apiGroups: ["networking.k8s.io"]
     resources: ["ingresses"]
-    verbs: ["get", "list", "create", "delete"]
+    verbs: ["get", "list", "create", "update", "patch", "delete"]
   # NetworkPolicy management (tenant isolation)
   - apiGroups: ["networking.k8s.io"]
     resources: ["networkpolicies"]

@@ -1340,17 +1340,20 @@ export class ProvisioningService {
     } catch (error: any) {
       if (this.isAlreadyExistsError(error)) {
         // Patch the group.name annotation so retries move the ingress to the current ALB group
-        await this.networkingApi.patchNamespacedIngress({
-          name: 'betterdb',
-          namespace,
-          body: {
-            metadata: {
-              annotations: {
-                'alb.ingress.kubernetes.io/group.name': this.albGroupName,
+        await this.networkingApi.patchNamespacedIngress(
+          {
+            name: 'betterdb',
+            namespace,
+            body: {
+              metadata: {
+                annotations: {
+                  'alb.ingress.kubernetes.io/group.name': this.albGroupName,
+                },
               },
             },
           },
-        });
+          k8s.setHeaderOptions('Content-Type', k8s.PatchStrategy.MergePatch),
+        );
       } else {
         throw error;
       }

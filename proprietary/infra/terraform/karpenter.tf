@@ -82,8 +82,8 @@ resource "kubectl_manifest" "karpenter_node_pool" {
               operator: In
               values: ${jsonencode(var.availability_zones)}
       limits:
-        cpu: "80"
-        memory: "160Gi"
+        cpu: "320"
+        memory: "800Gi"
       disruption:
         consolidationPolicy: WhenEmptyOrUnderutilized
         consolidateAfter: 60s
