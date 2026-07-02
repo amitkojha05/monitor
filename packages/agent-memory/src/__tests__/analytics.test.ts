@@ -1,17 +1,11 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { createAnalytics, NOOP_ANALYTICS, type AnalyticsClient } from '../analytics';
+import { createAnalytics, NOOP_ANALYTICS, PostHogAnalytics, type AnalyticsClient } from '../analytics';
 
-const phState = vi.hoisted(() => ({
+const phState = {
   capture: vi.fn(),
+  flush: vi.fn().mockResolvedValue(undefined),
   shutdown: vi.fn().mockResolvedValue(undefined),
-}));
-
-vi.mock('posthog-node', () => ({
-  PostHog: class {
-    capture = phState.capture;
-    shutdown = phState.shutdown;
-  },
-}));
+};
 
 function createMockClient(getResult: unknown = null): AnalyticsClient & { call: ReturnType<typeof vi.fn> } {
   return {
@@ -28,7 +22,11 @@ describe('analytics', () => {
 
   beforeEach(() => {
     delete process.env.BETTERDB_TELEMETRY;
+    // Pin the per-install identity so distinctId is deterministic and the test
+    // never reads/writes the real ~/.betterdb/instance_id.
+    process.env.BETTERDB_INSTANCE_ID = 'install-123';
     phState.capture.mockReset();
+    phState.flush.mockReset().mockResolvedValue(undefined);
     phState.shutdown.mockReset().mockResolvedValue(undefined);
   });
 
@@ -37,7 +35,7 @@ describe('analytics', () => {
   });
 
   it('returns noop when disabled option is true', async () => {
-    const analytics = await createAnalytics({ apiKey: 'phc_test', disabled: true });
+    const analytics = await createAnalytics({ disabled: true });
     expect(analytics).toBe(NOOP_ANALYTICS);
   });
 
@@ -48,13 +46,13 @@ describe('analytics', () => {
 
   it('returns noop when BETTERDB_TELEMETRY=false', async () => {
     process.env.BETTERDB_TELEMETRY = 'false';
-    const analytics = await createAnalytics({ apiKey: 'phc_test' });
+    const analytics = await createAnalytics();
     expect(analytics).toBe(NOOP_ANALYTICS);
   });
 
   it('returns noop when BETTERDB_TELEMETRY=0', async () => {
     process.env.BETTERDB_TELEMETRY = '0';
-    const analytics = await createAnalytics({ apiKey: 'phc_test' });
+    const analytics = await createAnalytics();
     expect(analytics).toBe(NOOP_ANALYTICS);
   });
 
@@ -73,14 +71,14 @@ describe('analytics', () => {
     });
   });
 
-  describe('PostHogAnalytics via createAnalytics', () => {
-    it('init persists new UUID via SET when no existing ID', async () => {
-      const analytics = await createAnalytics({ apiKey: 'phc_test_key' });
-      expect(analytics).not.toBe(NOOP_ANALYTICS);
+  describe('PostHogAnalytics', () => {
+    it('uses the per-install id as distinctId and persists a deployment id via SET', async () => {
+      const analytics = new PostHogAnalytics(phState);
 
       const client = createMockClient(null);
       await analytics.init(client, 'myprefix', { hasEmbedFn: true });
 
+      // The Valkey-scoped deployment id is still generated and persisted.
       expect(client.call).toHaveBeenCalledWith('GET', 'myprefix:__instance_id');
       expect(client.call).toHaveBeenCalledWith(
         'SET',
@@ -88,25 +86,35 @@ describe('analytics', () => {
         expect.stringMatching(/^[0-9a-f-]{36}$/),
       );
 
+      // distinctId identifies the install, not the Valkey store; the deployment
+      // id rides along as a property for roll-up.
       expect(phState.capture).toHaveBeenCalledWith(
         expect.objectContaining({
           event: 'agent_memory:memory_init',
-          properties: { hasEmbedFn: true },
+          distinctId: 'install-123',
+          properties: expect.objectContaining({
+            hasEmbedFn: true,
+            deployment_id: expect.stringMatching(/^[0-9a-f-]{36}$/),
+          }),
         }),
       );
+      // The start event is flushed immediately so it lands without an exit hook.
+      expect(phState.flush).toHaveBeenCalled();
     });
 
-    it('init reuses existing UUID from GET', async () => {
-      const analytics = await createAnalytics({ apiKey: 'phc_test_key' });
+    it('reuses an existing deployment id without a SET write', async () => {
+      const analytics = new PostHogAnalytics(phState);
 
-      const existingId = 'existing-uuid-1234';
-      const client = createMockClient(existingId);
+      const client = createMockClient('stable-id');
       await analytics.init(client, 'myprefix');
 
       const setCalls = client.call.mock.calls.filter((c) => c[0] === 'SET');
       expect(setCalls).toHaveLength(0);
       expect(phState.capture).toHaveBeenCalledWith(
-        expect.objectContaining({ distinctId: existingId }),
+        expect.objectContaining({
+          distinctId: 'install-123',
+          properties: expect.objectContaining({ deployment_id: 'stable-id' }),
+        }),
       );
     });
 
@@ -115,7 +123,7 @@ describe('analytics', () => {
         throw new Error('PostHog error');
       });
 
-      const analytics = await createAnalytics({ apiKey: 'phc_test_key' });
+      const analytics = new PostHogAnalytics(phState);
       const client = createMockClient();
       await analytics.init(client, 'test');
       expect(() => analytics.capture('some_event')).not.toThrow();
@@ -123,7 +131,7 @@ describe('analytics', () => {
 
     it('shutdown never throws even if posthog throws', async () => {
       phState.shutdown.mockRejectedValue(new Error('shutdown error'));
-      const analytics = await createAnalytics({ apiKey: 'phc_test_key' });
+      const analytics = new PostHogAnalytics(phState);
       await expect(analytics.shutdown()).resolves.toBeUndefined();
     });
   });

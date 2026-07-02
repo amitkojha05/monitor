@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { createAnalytics, NOOP_ANALYTICS, type ValkeyLike } from '../analytics';
+import { createAnalytics, NOOP_ANALYTICS, PostHogAnalytics, type ValkeyLike } from '../analytics';
 
 function createMockValkeyClient(): ValkeyLike & { get: ReturnType<typeof vi.fn>; set: ReturnType<typeof vi.fn> } {
   return {
@@ -8,11 +8,22 @@ function createMockValkeyClient(): ValkeyLike & { get: ReturnType<typeof vi.fn>;
   };
 }
 
+function createMockPostHog() {
+  return {
+    capture: vi.fn(),
+    flush: vi.fn().mockResolvedValue(undefined),
+    shutdown: vi.fn().mockResolvedValue(undefined),
+  };
+}
+
 describe('analytics', () => {
   const originalEnv = { ...process.env };
 
   beforeEach(() => {
     delete process.env.BETTERDB_TELEMETRY;
+    // Pin the per-install identity so distinctId is deterministic and the test
+    // never reads/writes the real ~/.betterdb/instance_id.
+    process.env.BETTERDB_INSTANCE_ID = 'install-123';
   });
 
   afterEach(() => {
@@ -20,7 +31,7 @@ describe('analytics', () => {
   });
 
   it('returns noop when disabled option is true', async () => {
-    const analytics = await createAnalytics({ apiKey: 'phc_test', disabled: true });
+    const analytics = await createAnalytics({ disabled: true });
     expect(analytics).toBe(NOOP_ANALYTICS);
   });
 
@@ -31,23 +42,14 @@ describe('analytics', () => {
 
   it('returns noop when BETTERDB_TELEMETRY=false', async () => {
     process.env.BETTERDB_TELEMETRY = 'false';
-    const analytics = await createAnalytics({ apiKey: 'phc_test' });
+    const analytics = await createAnalytics();
     expect(analytics).toBe(NOOP_ANALYTICS);
   });
 
   it('returns noop when BETTERDB_TELEMETRY=0', async () => {
     process.env.BETTERDB_TELEMETRY = '0';
-    const analytics = await createAnalytics({ apiKey: 'phc_test' });
+    const analytics = await createAnalytics();
     expect(analytics).toBe(NOOP_ANALYTICS);
-  });
-
-  it('returns noop when posthog-node is not installed (dynamic import fails)', async () => {
-    // posthog-node is not installed in dev dependencies, so this will return noop
-    // unless it happens to be in node_modules from the monorepo
-    const analytics = await createAnalytics({ apiKey: 'phc_test' });
-    // Either noop (not installed) or real instance — both are valid.
-    // The key assertion is it does not throw.
-    expect(analytics).toBeDefined();
   });
 
   describe('NOOP_ANALYTICS', () => {
@@ -65,99 +67,69 @@ describe('analytics', () => {
     });
   });
 
-  describe('PostHogAnalytics via createAnalytics', () => {
-    // To test the real PostHogAnalytics class without installing posthog-node,
-    // we mock the dynamic import. We do this at a higher level by testing
-    // init/capture/shutdown behavior through the factory.
-
-    it('init persists new UUID via Valkey SET when no existing ID', async () => {
-      const mockCapture = vi.fn();
-      const mockShutdown = vi.fn().mockResolvedValue(undefined);
-
-      // Mock the dynamic import of posthog-node
-      vi.doMock('posthog-node', () => ({
-        PostHog: class {
-          capture = mockCapture;
-          shutdown = mockShutdown;
-        },
-      }));
-
-      // Re-import to pick up mock
-      const { createAnalytics: create } = await import('../analytics');
-
-      const analytics = await create({ apiKey: 'phc_test_key' });
-      expect(analytics).not.toBe(NOOP_ANALYTICS);
+  describe('PostHogAnalytics', () => {
+    it('uses the per-install id as distinctId and persists a deployment id via Valkey SET', async () => {
+      const ph = createMockPostHog();
+      const analytics = new PostHogAnalytics(ph);
 
       const client = createMockValkeyClient();
       client.get.mockResolvedValue(null);
 
       await analytics.init(client, 'myprefix', { defaultTtl: 300 });
 
-      // Should have called GET then SET
+      // The Valkey-scoped deployment id is still generated and persisted.
       expect(client.get).toHaveBeenCalledWith('myprefix:__instance_id');
       expect(client.set).toHaveBeenCalledWith(
         'myprefix:__instance_id',
         expect.stringMatching(/^[0-9a-f-]{36}$/),
       );
 
-      // Should have captured cache_init
-      expect(mockCapture).toHaveBeenCalledWith(
+      // distinctId identifies the install; the deployment id rides along as a
+      // property for roll-up.
+      expect(ph.capture).toHaveBeenCalledWith(
         expect.objectContaining({
           event: 'agent_cache:cache_init',
-          properties: { defaultTtl: 300 },
+          distinctId: 'install-123',
+          properties: expect.objectContaining({
+            defaultTtl: 300,
+            deployment_id: expect.stringMatching(/^[0-9a-f-]{36}$/),
+          }),
         }),
       );
+      // The start event is flushed immediately so it lands without an exit hook.
+      expect(ph.flush).toHaveBeenCalled();
 
-      vi.doUnmock('posthog-node');
+      await analytics.shutdown();
     });
 
-    it('init reuses existing UUID from Valkey GET', async () => {
-      const mockCapture = vi.fn();
-      const mockShutdown = vi.fn().mockResolvedValue(undefined);
-
-      vi.doMock('posthog-node', () => ({
-        PostHog: class {
-          capture = mockCapture;
-          shutdown = mockShutdown;
-        },
-      }));
-
-      const { createAnalytics: create } = await import('../analytics');
-      const analytics = await create({ apiKey: 'phc_test_key' });
+    it('reuses an existing deployment id without a Valkey SET write', async () => {
+      const ph = createMockPostHog();
+      const analytics = new PostHogAnalytics(ph);
 
       const client = createMockValkeyClient();
-      const existingId = 'existing-uuid-1234';
-      client.get.mockResolvedValue(existingId);
+      client.get.mockResolvedValue('stable-id');
 
       await analytics.init(client, 'myprefix');
 
-      // Should NOT have called SET since ID already exists
+      // Should NOT have called SET since the deployment id already exists.
       expect(client.set).not.toHaveBeenCalled();
 
-      // Should use existing ID as distinctId
-      expect(mockCapture).toHaveBeenCalledWith(
+      expect(ph.capture).toHaveBeenCalledWith(
         expect.objectContaining({
-          distinctId: existingId,
+          distinctId: 'install-123',
+          properties: expect.objectContaining({ deployment_id: 'stable-id' }),
         }),
       );
 
-      vi.doUnmock('posthog-node');
+      await analytics.shutdown();
     });
 
     it('capture never throws even if posthog throws', async () => {
-      const mockCapture = vi.fn().mockImplementation(() => {
+      const ph = createMockPostHog();
+      ph.capture.mockImplementation(() => {
         throw new Error('PostHog error');
       });
-
-      vi.doMock('posthog-node', () => ({
-        PostHog: class {
-          capture = mockCapture;
-          shutdown = vi.fn().mockResolvedValue(undefined);
-        },
-      }));
-
-      const { createAnalytics: create } = await import('../analytics');
-      const analytics = await create({ apiKey: 'phc_test_key' });
+      const analytics = new PostHogAnalytics(ph);
 
       const client = createMockValkeyClient();
       await analytics.init(client, 'test');
@@ -165,23 +137,15 @@ describe('analytics', () => {
       // Should not throw
       expect(() => analytics.capture('some_event')).not.toThrow();
 
-      vi.doUnmock('posthog-node');
+      await analytics.shutdown();
     });
 
     it('shutdown never throws even if posthog throws', async () => {
-      vi.doMock('posthog-node', () => ({
-        PostHog: class {
-          capture = vi.fn();
-          shutdown = vi.fn().mockRejectedValue(new Error('shutdown error'));
-        },
-      }));
-
-      const { createAnalytics: create } = await import('../analytics');
-      const analytics = await create({ apiKey: 'phc_test_key' });
+      const ph = createMockPostHog();
+      ph.shutdown.mockRejectedValue(new Error('shutdown error'));
+      const analytics = new PostHogAnalytics(ph);
 
       await expect(analytics.shutdown()).resolves.toBeUndefined();
-
-      vi.doUnmock('posthog-node');
     });
   });
 });
