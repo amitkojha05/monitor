@@ -4,7 +4,7 @@ import { createMockEmbedder, createOpenAIEmbedder } from './embed';
 import { createMockStore, createRealStore } from './store';
 import { createMockReader, createOpenAIReader } from './reader';
 import { createMockJudge, createOpenAIJudge } from './judge';
-import { loadRecords, sourceLabel } from './dataset';
+import { loadRecords, parseTypeList, sourceLabel } from './dataset';
 import { runEval, formatSummary } from './runner';
 import { resolveEnabledLevers, createCostReport } from './levers';
 import { resolveAssembleOptions } from './assemble';
@@ -28,6 +28,28 @@ async function main(): Promise<void> {
   const rerankPool = Math.max(envInt('LONGMEMEVAL_RERANK_POOL', k), k);
   const chunkMode: ChunkMode = process.env.LONGMEMEVAL_CHUNK === 'turn' ? 'turn' : 'session';
   const qa = process.env.LONGMEMEVAL_QA === '1';
+  // Restrict the run to one or more question_types (comma-separated, e.g.
+  // "temporal-reasoning,multi-session") so a subset can be evaluated in
+  // isolation. Unset = all types.
+  const questionType = process.env.LONGMEMEVAL_TYPE;
+  // Stratified slice: keep this many records of EACH question_type (balanced
+  // across all types) instead of the flat limit. Unset/0 = flat limit. Because
+  // _m/_s are grouped by type on disk, this is the only way to get an even
+  // per-type sample for a paired A/B.
+  const perType = envInt('LONGMEMEVAL_PER_TYPE', 0);
+  // LongMemEval has 6 question_types. In stratified mode the total = perType x
+  // (number of selected types), so the runner's per-record `limit` cap must be
+  // raised to that total or it would truncate the slice. Count DISTINCT types
+  // (deduped, mirroring loadRecords' Set-based allow-list) so a repeated type
+  // does not inflate the cap; an empty/whitespace-only filter selects all
+  // types, so fall back to the full count (never zero, which would stop the
+  // run at once while loadRecords still emitted a stratified sample).
+  const LME_TYPE_COUNT = 6;
+  // Same parse as loadRecords' allow-list (via the shared helper) so the cap
+  // here and the early-stop there can never disagree.
+  const selectedTypes = parseTypeList(questionType);
+  const typeCount = selectedTypes.size > 0 ? selectedTypes.size : LME_TYPE_COUNT;
+  const runLimit = perType > 0 ? perType * typeCount : limit;
   const levers = resolveEnabledLevers(process.env);
   const costReport = createCostReport();
   const assembleOptions = resolveAssembleOptions(process.env);
@@ -61,7 +83,10 @@ async function main(): Promise<void> {
     }
   }
 
-  const records = loadRecords(dataPath, limit);
+  // Pass typeCount so stratified mode can early-stop after the caps fill even
+  // when no explicit LONGMEMEVAL_TYPE filter is set, instead of scanning a
+  // multi-GB dataset to EOF.
+  const records = loadRecords(dataPath, limit, questionType, perType, typeCount);
   const source = sourceLabel(dataPath);
 
   const tier = qa
@@ -78,10 +103,13 @@ async function main(): Promise<void> {
   console.log(`store     : ${store.name}${store.isReal ? '' : '  (Valkey unreachable → mock)'}`);
   console.log(`reader    : ${reader === null ? 'disabled' : reader.name}`);
   console.log(`judge     : ${judge === null ? 'disabled' : judge.name}`);
-  console.log(`dataset   : ${source}  (limit ${limit})`);
+  const limitLabel = perType > 0 ? `${perType}/type x${typeCount}=${runLimit}` : `${limit}`;
+  console.log(
+    `dataset   : ${source}  (limit ${limitLabel}${questionType ? `, type=${questionType}` : ''})`,
+  );
   const rerankLabel = rerankPool > k ? `hybrid pool=${rerankPool}→${k}` : 'off';
   console.log(
-    `params    : limit=${limit} k=${k} chunk=${chunkMode} qa=${qa} rerank=${rerankLabel}`,
+    `params    : limit=${limitLabel} k=${k} chunk=${chunkMode} qa=${qa} rerank=${rerankLabel}`,
   );
   console.log(`levers    : ${levers.length > 0 ? levers.join(' → ') : 'none (baseline)'}`);
   if (levers.includes('assemble')) {
@@ -111,7 +139,7 @@ async function main(): Promise<void> {
       judge,
       k,
       chunkMode,
-      limit,
+      limit: runLimit,
       rerankPool,
       levers,
       costReport,
