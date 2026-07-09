@@ -5,6 +5,15 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.11.1] - 2026-07-09
+
+### Fixed
+
+- **Build no longer ships compiled tests** — `tsconfig.json` `exclude` now
+  matches nested test dirs (`src/**/__tests__` instead of only `src/__tests__`),
+  so `src/adapters/__tests__` is kept out of the published `dist/`. No runtime
+  or API changes.
+
 ## [0.11.0] - 2026-07-07
 
 ### Added
