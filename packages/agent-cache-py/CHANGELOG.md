@@ -1,3 +1,23 @@
+## [0.10.0] - 2026-07-09
+
+### Added
+
+- **OpenAI Agents SDK adapter** (`betterdb_agent_cache.adapters.openai_agents`).
+  Exact-match LLM caching for the [OpenAI Agents SDK](https://github.com/openai/openai-agents-python),
+  intercepting at the `Model.get_response()` level so agent workloads that
+  replay the same tool-call sequences (eval, testing, multi-agent orchestration)
+  skip the API entirely. Distinct from the existing Chat Completions
+  (`openai`) and Responses (`openai_responses`) adapters.
+  - `CachedModel(model, cache)` — wraps any Agents SDK `Model`; cache-before-call
+    on `get_response()`. `stream_response()` is delegated uncached (per the
+    BetterDB streaming convention).
+  - `CachedModelProvider(provider, cache)` — wraps any `ModelProvider` so every
+    `Model` it yields is cache-enabled. Recommended integration via
+    `RunConfig(model_provider=...)`.
+  - `prepare_params()` normalizes Agents SDK `get_response()` inputs
+    (system instructions + Responses API input items) to `LlmCacheParams`.
+  - New optional dependency extra: `openai_agents` (`openai-agents>=0.1.0`).
+
 ## [0.7.0] - 2026-06-11
 
 ### Fixed
