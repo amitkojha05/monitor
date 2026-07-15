@@ -1042,6 +1042,9 @@ export class ProvisioningService {
   private async createDbSecret(namespace: string, storageUrl: string): Promise<void> {
     // Generate a unique per-tenant session secret for cookie signing
     const sessionSecret = crypto.randomBytes(32).toString('hex');
+    // Per-tenant bearer token guarding OTLP trace ingestion (POST /v1/traces).
+    // The monitor image fails closed on boot when CLOUD_MODE is set without it.
+    const otelIngestToken = crypto.randomBytes(32).toString('hex');
 
     try {
       await this.coreApi.createNamespacedSecret({
@@ -1057,6 +1060,7 @@ export class ProvisioningService {
             CLOUD_MODE: 'true',
             AUTH_PUBLIC_KEY: this.authPublicKey,
             SESSION_SECRET: sessionSecret,
+            OTEL_INGEST_TOKEN: otelIngestToken,
             // Entitlement API config (for workspace management)
             ENTITLEMENT_API_URL: this.entitlementApiUrl,
             ENTITLEMENT_API_KEY: this.entitlementApiKey,
@@ -1208,6 +1212,15 @@ export class ProvisioningService {
                           secretKeyRef: {
                             name: 'db-credentials',
                             key: 'SESSION_SECRET',
+                          },
+                        },
+                      },
+                      {
+                        name: 'OTEL_INGEST_TOKEN',
+                        valueFrom: {
+                          secretKeyRef: {
+                            name: 'db-credentials',
+                            key: 'OTEL_INGEST_TOKEN',
                           },
                         },
                       },
