@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "betterdb-valkey-search-kit"
-version = "0.1.0"
+version = "0.1.1"
 description = "Shared Valkey Search (FT.*) helpers: float32 vector encoding, FT.SEARCH reply parsing, version-skew FT.INFO parsing, TAG escaping, and error classification."
 keywords = ["valkey", "redis", "valkey-search", "vector-search", "ft", "redisearch"]
 license = { text = "MIT" }
