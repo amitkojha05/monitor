@@ -13,6 +13,8 @@ export enum WebhookEventType {
   CONFIG_CHANGED = 'config.changed',
   REPLICATION_LAG = 'replication.lag',
   CLUSTER_FAILOVER = 'cluster.failover',
+  CLUSTER_BUS_CORRUPTION = 'cluster.bus.corruption',
+  CLUSTER_DEMOTED_WRITES = 'cluster.demoted.writes',
   FAILOVER_STARTED = 'failover.started',
   FAILOVER_COMPLETED = 'failover.completed',
   DATA_LOSS_DETECTED = 'data.loss.detected',
@@ -50,6 +52,8 @@ export const PRO_EVENTS: WebhookEventType[] = [
   WebhookEventType.SLOWLOG_THRESHOLD,
   WebhookEventType.REPLICATION_LAG,
   WebhookEventType.CLUSTER_FAILOVER,
+  WebhookEventType.CLUSTER_BUS_CORRUPTION,
+  WebhookEventType.CLUSTER_DEMOTED_WRITES,
   WebhookEventType.LATENCY_SPIKE,
   WebhookEventType.CONNECTION_SPIKE,
   WebhookEventType.METRIC_FORECAST_LIMIT,
@@ -98,6 +102,8 @@ export const WEBHOOK_EVENT_TIERS: Record<WebhookEventType, Tier> = {
   [WebhookEventType.SLOWLOG_THRESHOLD]: Tier.pro,
   [WebhookEventType.REPLICATION_LAG]: Tier.pro,
   [WebhookEventType.CLUSTER_FAILOVER]: Tier.pro,
+  [WebhookEventType.CLUSTER_BUS_CORRUPTION]: Tier.pro,
+  [WebhookEventType.CLUSTER_DEMOTED_WRITES]: Tier.pro,
   [WebhookEventType.LATENCY_SPIKE]: Tier.pro,
   [WebhookEventType.CONNECTION_SPIKE]: Tier.pro,
   [WebhookEventType.METRIC_FORECAST_LIMIT]: Tier.pro,
@@ -334,8 +340,61 @@ export interface IWebhookEventsProService {
   dispatchClusterFailover(data: {
     clusterState: string;
     previousState?: string;
+    /**
+     * What tripped the detection. A clean failover leaves cluster_state
+     * unchanged, so the consumer needs this to know what happened.
+     */
+    reasons?: string[];
+    /**
+     * Which nodes moved and how. Empty for a state-only or slot-failure
+     * trigger; a consumer paging on a clean failover needs it to know what
+     * actually changed.
+     */
+    changedNodes?: Array<{ nodeId: string; reason: string; from: string; to: string }>;
     slotsAssigned: number;
     slotsFailed: number;
+    knownNodes: number;
+    timestamp: number;
+    instance: WebhookInstanceInfo;
+    connectionId?: string;
+  }): Promise<void>;
+
+  /**
+   * A node the cluster has already demoted is still answering as a master and
+   * still taking writes. Separate from cluster.failover because the severity
+   * and the runbook differ: the failover already happened, and this is the
+   * window in which writes are being accepted and then lost.
+   */
+  dispatchClusterDemotedWrites(data: {
+    nodeId: string;
+    nodeAddress: string;
+    /** How long the node has been disagreeing with the cluster about its role. */
+    disagreementMs: number;
+    /** Milliseconds since the failover that demoted it. */
+    demotedForMs: number;
+    opsPerSec: number;
+    /**
+     * Write-command calls counted on the node since it began disagreeing about
+     * its role. Absent when nothing could be counted — the node exposes no
+     * commandstats, or its counter was reset — in which case opsPerSec is the
+     * only traffic evidence and the writes are inferred, not counted.
+     */
+    writeCallsDelta?: number;
+    /**
+     * `critical` when writes were counted, `warning` when the alert rests on
+     * `opsPerSec` alone — that total includes reads, so the traffic may have
+     * cost nothing and does not warrant a page.
+     */
+    severity: 'critical' | 'warning';
+    message: string;
+    timestamp: number;
+    instance: WebhookInstanceInfo;
+    connectionId?: string;
+  }): Promise<void>;
+
+  dispatchClusterBusCorruption(data: {
+    crcMismatchTotal: number;
+    crcMismatchDelta: number;
     knownNodes: number;
     timestamp: number;
     instance: WebhookInstanceInfo;

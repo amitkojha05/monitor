@@ -24,11 +24,36 @@ import {
 import { MetricForecastingService } from '../metric-forecasting/metric-forecasting.service';
 import { ALL_METRIC_KINDS } from '@betterdb/shared';
 import { OtelEventDispatcherService } from '../otel-telemetry/otel-event-dispatcher.service';
+import {
+  diffClusterTopology,
+  snapshotTopology,
+  TopologyDiff,
+  TopologySnapshot,
+} from '../cluster/topology-diff';
+import { ClusterMetricsService } from '../cluster/cluster-metrics.service';
+import {
+  demotedWritesMessage,
+  evaluateDemotedWrites,
+  pruneDemotionWatch,
+  recordDemotions,
+  DemotedNodeObservation,
+  DemotionWatch,
+} from '../cluster/demoted-writes';
+
+/**
+ * Ceiling on the demoted-node read, clamped down to the poll interval when that
+ * is shorter. Two INFO round trips to one node take milliseconds when the node
+ * is answering at all.
+ */
+const DEMOTED_NODE_READ_TIMEOUT_MS = 2_000;
 
 // Per-connection state for tracking previous values and stale labels
 interface ConnectionMetricState {
   previousClusterState: string | null;
   previousSlotsFail: number;
+  previousCrcMismatch: number | null;
+  previousTopology: TopologySnapshot | null;
+  demotionWatch: DemotionWatch;
   currentKeyspaceDbLabels: Set<string>;
   currentClusterSlotLabels: Set<string>;
   // Storage-based metric labels (per-connection)
@@ -61,6 +86,10 @@ export class PrometheusService extends MultiConnectionPoller implements OnModule
 
   // Per-connection state tracking
   private perConnectionState = new Map<string, ConnectionMetricState>();
+
+  // Per-connection in-flight INFO-metric updates, so the background poller and a
+  // /metrics scrape coalesce instead of racing on shared per-connection state.
+  private updateMetricsInFlight = new Map<string, Promise<void>>();
 
   // ACL Audit Metrics
   private aclDeniedTotal: Gauge;
@@ -134,6 +163,7 @@ export class PrometheusService extends MultiConnectionPoller implements OnModule
   private clusterSlotsOk: Gauge;
   private clusterSlotsFail: Gauge;
   private clusterSlotsPfail: Gauge;
+  private clusterStatsMessagesCrcMismatch: Gauge;
 
   // Cluster Slot Metrics (Valkey 8.0+ specific)
   private clusterSlotKeys: Gauge;
@@ -207,6 +237,8 @@ export class PrometheusService extends MultiConnectionPoller implements OnModule
     private readonly metricForecastingService?: MetricForecastingService,
     @Optional()
     private readonly otelEvents?: OtelEventDispatcherService,
+    @Optional()
+    private readonly clusterMetricsService?: ClusterMetricsService,
   ) {
     super(connectionRegistry);
     this.pollIntervalMs = this.configService.get<number>('PROMETHEUS_POLL_INTERVAL_MS', 5000);
@@ -263,6 +295,9 @@ export class PrometheusService extends MultiConnectionPoller implements OnModule
       this.perConnectionState.set(connectionId, {
         previousClusterState: null,
         previousSlotsFail: 0,
+        previousCrcMismatch: null,
+        previousTopology: null,
+        demotionWatch: new Map(),
         currentKeyspaceDbLabels: new Set(),
         currentClusterSlotLabels: new Set(),
         // Storage-based metric labels
@@ -488,6 +523,10 @@ export class PrometheusService extends MultiConnectionPoller implements OnModule
       'cluster_slots_pfail',
       'Number of slots in PFAIL state',
     );
+    this.clusterStatsMessagesCrcMismatch = this.createGauge(
+      'cluster_stats_messages_crc_mismatch',
+      'Cluster bus messages rejected by the CRC integrity check (valkey#4201); any increase means on-wire corruption',
+    );
 
     // Cluster Slot Metrics (Valkey 8.0+) - per connection, per slot
     this.clusterSlotKeys = this.createGauge('cluster_slot_keys', 'Keys in cluster slot', ['slot']);
@@ -665,7 +704,7 @@ export class PrometheusService extends MultiConnectionPoller implements OnModule
   }
 
   /**
-   * Update metrics for ALL registered connections (used by /metrics endpoint)
+   * Update metrics for ALL registered connections (used by /metrics endpoint).
    */
   async updateMetrics(): Promise<void> {
     const connections = this.connectionRegistry.list();
@@ -741,7 +780,35 @@ export class PrometheusService extends MultiConnectionPoller implements OnModule
   /**
    * Update all INFO-based metrics for a specific connection
    */
-  private async updateMetricsForConnection(connectionId: string): Promise<void> {
+  /**
+   * Coalesces concurrent INFO-based metric updates for the SAME connection onto
+   * one in-flight pass. Two independent entry points reach here — the background
+   * poller (pollConnection) and the /metrics scrape (updateMetrics) — so without
+   * this a poll and a scrape could run getClusterInfo() concurrently for one
+   * connection; an older response completing last would move
+   * state.previousCrcMismatch backward and re-emit the same cluster.bus.corruption
+   * delta on the next poll. Serializing per connection (the granularity of the
+   * shared state) closes that race for both paths.
+   */
+  private updateMetricsForConnection(connectionId: string): Promise<void> {
+    const existing = this.updateMetricsInFlight.get(connectionId);
+    if (existing !== undefined) {
+      return existing;
+    }
+    const run = this.runUpdateMetricsForConnection(connectionId).finally(() => {
+      // Compare-and-delete: only clear the entry if it is still ours. If the
+      // connection was removed (cleanupConnectionMetrics) or re-added with a
+      // fresh in-flight update while this one ran, we must not evict that newer
+      // entry when this stale promise settles.
+      if (this.updateMetricsInFlight.get(connectionId) === run) {
+        this.updateMetricsInFlight.delete(connectionId);
+      }
+    });
+    this.updateMetricsInFlight.set(connectionId, run);
+    return run;
+  }
+
+  private async runUpdateMetricsForConnection(connectionId: string): Promise<void> {
     const client = this.connectionRegistry.get(connectionId);
     if (!client) {
       this.logger.warn(`No client for connection ${connectionId}, skipping metrics`);
@@ -1069,6 +1136,66 @@ export class PrometheusService extends MultiConnectionPoller implements OnModule
           .set(parseInt(clusterInfo.cluster_slots_pfail) || 0);
       }
 
+      // Cluster-bus CRC integrity (valkey#4201). The field is only present on
+      // builds shipping the check with `cluster-crc-enabled` on; a "0" value is
+      // still truthy, so an absent field (undefined) is the only skipped case.
+      const crcRaw = clusterInfo.cluster_stats_messages_crc_mismatch;
+      if (!crcRaw) {
+        // Field gone (check disabled or counter no longer reported). Drop the
+        // baseline so a later re-appearance re-seeds from its first value rather
+        // than diffing against a stale pre-gap baseline and firing a false delta,
+        // and remove the gauge child so Prometheus stops exporting the last value
+        // as if it were current.
+        state.previousCrcMismatch = null;
+        this.clusterStatsMessagesCrcMismatch.remove(connLabel);
+      }
+      if (crcRaw) {
+        const crcMismatch = parseInt(crcRaw) || 0;
+        this.clusterStatsMessagesCrcMismatch.labels(connLabel).set(crcMismatch);
+
+        // Any increase means the bus rejected a corrupted gossip/message (bit
+        // flip, bad NIC/switch). A single bogus configEpoch can permanently
+        // scramble slot ownership (valkey#4201/#4092), so we surface any nonzero
+        // delta rather than a threshold. The first observation seeds the baseline
+        // so a pre-existing counter value does not fire on startup.
+        // Advance the baseline before any await so an overlapping poll cannot read
+        // the old value and re-dispatch the same delta.
+        const previousCrcMismatch = state.previousCrcMismatch;
+        state.previousCrcMismatch = crcMismatch;
+
+        if (previousCrcMismatch !== null && crcMismatch > previousCrcMismatch) {
+          const crcMismatchDelta = crcMismatch - previousCrcMismatch;
+          const knownNodes = parseInt(clusterInfo.cluster_known_nodes) || 0;
+
+          // OTLP mirror is decoupled from the Pro webhook gate (parity with
+          // cluster.failover), so an OTLP-only deployment still sees corruption.
+          try {
+            this.otelEvents?.dispatch(
+              WebhookEventType.CLUSTER_BUS_CORRUPTION,
+              { crcMismatchTotal: crcMismatch, crcMismatchDelta, knownNodes },
+              connectionId,
+            );
+          } catch (err) {
+            this.logger.error('Failed to dispatch cluster.bus.corruption OTLP event', err);
+          }
+
+          if (this.webhookEventsProService) {
+            try {
+              await this.webhookEventsProService.dispatchClusterBusCorruption({
+                crcMismatchTotal: crcMismatch,
+                crcMismatchDelta,
+                knownNodes,
+                timestamp: Date.now(),
+                instance: { host: config?.host || 'localhost', port: config?.port || 6379 },
+                connectionId,
+              });
+            } catch (err) {
+              this.logger.error('Failed to dispatch cluster.bus.corruption webhook', err);
+            }
+          }
+        }
+      }
+
       // cluster.failover: detect the edge, mirror to OTLP, and advance the
       // tracked state independent of webhook wiring, so an OTLP-only deployment
       // (no Pro webhook service) still sees failover — parity with the
@@ -1077,16 +1204,56 @@ export class PrometheusService extends MultiConnectionPoller implements OnModule
       const stateChanged = state.previousClusterState === 'ok' && clusterState === 'fail';
       const newSlotFailures = state.previousSlotsFail < slotsFail && slotsFail > 0;
 
-      if (stateChanged || newSlotFailures) {
+      // Both edges above read CLUSTER INFO, so they only see a cluster-wide
+      // outage. A clean master-replica failover leaves cluster_state:ok with no
+      // failed slots and produces nothing — and that is the common case under
+      // load and during rolling upgrades (valkey#4340). Diff the topology too.
+      let topology: TopologySnapshot | null = null;
+      let topologyDiff: TopologyDiff | null = null;
+      let topologyReasons: string[] = [];
+      let changedNodes: Array<{ nodeId: string; reason: string; from: string; to: string }> = [];
+      try {
+        topology = snapshotTopology(await client.getClusterNodes());
+        topologyDiff = diffClusterTopology(state.previousTopology, topology);
+        topologyReasons = topologyDiff.reasons;
+        changedNodes = topologyDiff.changedNodes;
+      } catch (err) {
+        // CLUSTER NODES can be denied or fail independently of CLUSTER INFO.
+        // Losing the topology signal must not take metric scraping down with
+        // it, and must not reset the baseline — keeping the last good snapshot
+        // means the next successful read still sees the change.
+        this.logger.debug(
+          `CLUSTER NODES failed for ${connectionId}: ${err instanceof Error ? err.message : err}`,
+        );
+      }
+
+      // One dispatch per poll no matter how many signals fired: a real outage
+      // trips the CLUSTER INFO edges and churns the topology at the same time,
+      // and two events for one failover would double-page.
+      const reasons: string[] = [];
+      if (stateChanged) {
+        reasons.push('cluster_state');
+      }
+      if (newSlotFailures) {
+        reasons.push('slot_failures');
+      }
+      reasons.push(...topologyReasons);
+
+      if (reasons.length > 0) {
         // OTLP mirror is decoupled from the Pro webhook gate (the dispatcher
         // no-ops unless OTEL_* is set).
         try {
+          // Serialized, not passed raw: buildEventAttributes keeps scalars only,
+          // so an array lands as nothing at all and the event arrives saying
+          // `ok` with no reason — the exact gap `reasons` exists to close.
           this.otelEvents?.dispatch(
             WebhookEventType.CLUSTER_FAILOVER,
             {
               clusterState,
               slotsFailed: slotsFail,
               knownNodes: parseInt(clusterInfo.cluster_known_nodes) || 0,
+              reasons: reasons.join(','),
+              ...(changedNodes.length > 0 ? { changedNodes: JSON.stringify(changedNodes) } : {}),
             },
             connectionId,
           );
@@ -1099,6 +1266,8 @@ export class PrometheusService extends MultiConnectionPoller implements OnModule
             await this.webhookEventsProService.dispatchClusterFailover({
               clusterState,
               previousState: state.previousClusterState ?? undefined,
+              reasons,
+              changedNodes,
               slotsAssigned: parseInt(clusterInfo.cluster_slots_assigned) || 0,
               slotsFailed: slotsFail,
               knownNodes: parseInt(clusterInfo.cluster_known_nodes) || 0,
@@ -1114,6 +1283,20 @@ export class PrometheusService extends MultiConnectionPoller implements OnModule
 
       state.previousClusterState = clusterState;
       state.previousSlotsFail = slotsFail;
+      if (topology !== null) {
+        state.previousTopology = topology;
+      }
+
+      // cluster.demoted.writes: the failover above is over, but the node it
+      // demoted may not know yet. While it still answers `role:master` it keeps
+      // accepting writes for slots it no longer owns, and those writes are
+      // discarded the moment the client's slot cache refreshes — silently.
+      const demotionCheckedAt = Date.now();
+      if (topologyDiff !== null) {
+        recordDemotions(state.demotionWatch, topologyDiff, demotionCheckedAt);
+      }
+      pruneDemotionWatch(state.demotionWatch, topology, demotionCheckedAt);
+      await this.detectDemotedMasterWrites(connectionId, state, config);
 
       const capabilities = client.getCapabilities();
       if (
@@ -1380,6 +1563,133 @@ export class PrometheusService extends MultiConnectionPoller implements OnModule
     }
   }
 
+  /**
+   * Report nodes stuck in the window between "the cluster demoted it" and "the
+   * node knows it was demoted". Only runs while the watch holds something, so
+   * a cluster that has not failed over pays nothing — the per-node INFO and
+   * commandstats reads are the expensive part.
+   */
+  private async detectDemotedMasterWrites(
+    connectionId: string,
+    state: ConnectionMetricState,
+    config: { host: string; port: number } | null,
+  ): Promise<void> {
+    if (state.demotionWatch.size === 0) {
+      return;
+    }
+    if (!this.clusterMetricsService) {
+      return;
+    }
+
+    let observations: DemotedNodeObservation[];
+    try {
+      // Scoped to the watched IDs: a demoted node is one node, and reading the
+      // whole cluster to observe it would cost two INFO round trips per node
+      // on every poll and every /metrics scrape for the length of the window.
+      const nodeStats = await this.readWithTimeout(
+        this.clusterMetricsService.getClusterNodeStats(connectionId, {
+          includeCommandStats: true,
+          nodeIds: [...state.demotionWatch.keys()],
+        }),
+      );
+      observations = nodeStats.map((node) => {
+        return {
+          nodeId: node.nodeId,
+          nodeAddress: node.nodeAddress,
+          selfReportedRole: node.selfReportedRole,
+          opsPerSec: node.opsPerSec,
+          writeCommandCalls: node.writeCommandCalls,
+        };
+      });
+    } catch (err) {
+      // Per-node reads fail independently of the cluster-wide ones. Losing them
+      // must not take the poll down, and must not advance the watch — the next
+      // successful read still sees the disagreement.
+      this.logger.debug(
+        `Demoted-node stats failed for ${connectionId}: ${err instanceof Error ? err.message : err}`,
+      );
+      return;
+    }
+
+    const alerts = evaluateDemotedWrites(
+      state.demotionWatch,
+      observations,
+      Date.now(),
+      this.pollIntervalMs,
+    );
+    for (const alert of alerts) {
+      const message = demotedWritesMessage(alert);
+      if (alert.severity === 'critical') {
+        this.logger.error(message);
+      } else {
+        this.logger.warn(message);
+      }
+
+      try {
+        this.otelEvents?.dispatch(
+          WebhookEventType.CLUSTER_DEMOTED_WRITES,
+          {
+            nodeId: alert.nodeId,
+            nodeAddress: alert.nodeAddress,
+            disagreementMs: alert.disagreementMs,
+            demotedForMs: alert.demotedForMs,
+            opsPerSec: alert.opsPerSec,
+            severity: alert.severity,
+            ...(alert.writeCallsDelta === undefined
+              ? {}
+              : { writeCallsDelta: alert.writeCallsDelta }),
+          },
+          connectionId,
+        );
+      } catch (err) {
+        this.logger.error('Failed to dispatch cluster.demoted.writes OTLP event', err);
+      }
+
+      if (this.webhookEventsProService) {
+        try {
+          await this.webhookEventsProService.dispatchClusterDemotedWrites({
+            nodeId: alert.nodeId,
+            nodeAddress: alert.nodeAddress,
+            disagreementMs: alert.disagreementMs,
+            demotedForMs: alert.demotedForMs,
+            opsPerSec: alert.opsPerSec,
+            writeCallsDelta: alert.writeCallsDelta,
+            severity: alert.severity,
+            message,
+            timestamp: Date.now(),
+            instance: { host: config?.host || 'localhost', port: config?.port || 6379 },
+            connectionId,
+          });
+        } catch (err) {
+          this.logger.error('Failed to dispatch cluster.demoted.writes webhook', err);
+        }
+      }
+    }
+  }
+
+  /**
+   * Bound the demoted-node read so a hung node cannot stall the metrics pass.
+   *
+   * The node under observation is by definition in a bad state, and the read is
+   * awaited inline in the poll. A timeout is treated like any other failed read:
+   * the watch keeps its evidence and the next poll tries again.
+   */
+  private async readWithTimeout<T>(work: Promise<T>): Promise<T> {
+    const limit = Math.min(this.pollIntervalMs, DEMOTED_NODE_READ_TIMEOUT_MS);
+    let timer: NodeJS.Timeout | undefined;
+    const expiry = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => {
+        reject(new Error(`demoted-node read exceeded ${limit}ms`));
+      }, limit);
+    });
+
+    try {
+      return await Promise.race([work, expiry]);
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
   async getMetrics(): Promise<string> {
     await this.updateMetrics();
     const metrics = await this.registry.metrics();
@@ -1634,6 +1944,10 @@ export class PrometheusService extends MultiConnectionPoller implements OnModule
    */
   cleanupConnectionMetrics(connectionId: string): void {
     this.perConnectionState.delete(connectionId);
+    // Drop any in-flight metric update so a reused connection ID cannot join
+    // stale work. The promise itself still settles; its compare-and-delete
+    // finally then no-ops because the entry is already gone.
+    this.updateMetricsInFlight.delete(connectionId);
     // Note: prom-client doesn't easily support removing specific label values
     // The metrics will be overwritten on next scrape or remain at last value
   }

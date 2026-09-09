@@ -35,6 +35,7 @@ export type {
   OtelTraceQueryOptions,
 } from '@betterdb/shared';
 export type { MetricForecastSettings, MetricKind } from '@betterdb/shared';
+export type { StoredCveDataset, CveScanResult } from '@betterdb/shared';
 export type {
   CacheType,
   ProposalType,
@@ -90,6 +91,8 @@ import type {
   StoredClientSnapshot,
   MetricForecastSettings,
   MetricKind,
+  StoredCveDataset,
+  CveScanResult,
   VectorIndexSnapshot,
   VectorIndexSnapshotQueryOptions,
   StoredAiCacheSample,
@@ -603,6 +606,12 @@ export interface StoragePort {
   getVectorIndexSnapshots(options: VectorIndexSnapshotQueryOptions): Promise<VectorIndexSnapshot[]>;
   pruneOldVectorIndexSnapshots(cutoffTimestamp: number, connectionId?: string): Promise<number>;
 
+  // CVE Inspection Methods
+  saveCveDataset(dataset: StoredCveDataset): Promise<void>;
+  getCveDataset(): Promise<StoredCveDataset | null>;
+  saveCveScanResult(result: CveScanResult): Promise<void>;
+  getCveScanResult(connectionId: string): Promise<CveScanResult | null>;
+
   // Monitor Capture Session Methods - connectionId required for writes, optional filter for reads
   saveCaptureSession(session: StoredCaptureSession, connectionId: string): Promise<string>;
   updateCaptureSession(id: string, patch: CaptureSessionPatch): Promise<boolean>;
@@ -703,4 +712,20 @@ export interface StoragePort {
   ): Promise<StoredMemoryProposalAudit>;
   getMemoryProposalAudit(proposalId: string): Promise<StoredMemoryProposalAudit[]>;
   expireMemoryProposalsBefore(now: number): Promise<StoredMemoryProposal[]>;
+  /**
+   * Move `applying` rows claimed before `cutoff` to `failed`. The apply path
+   * deliberately leaves a visible in-flight row if the process dies mid-apply;
+   * without this they stay `applying` forever and are found only by hand.
+   */
+  failStaleApplyingMemoryProposalsBefore(cutoff: number): Promise<StoredMemoryProposal[]>;
+  /**
+   * How many pending proposals in this store already target the same thing.
+   * Answers the duplicate question in the query rather than paging rows into
+   * memory and comparing them there.
+   */
+  countPendingMemoryProposalsByTarget(input: {
+    connection_id: string;
+    store_name: string;
+    target_discriminator: string;
+  }): Promise<number>;
 }

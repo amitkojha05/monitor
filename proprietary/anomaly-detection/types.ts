@@ -6,10 +6,14 @@ export enum MetricType {
   OUTPUT_KBPS = 'output_kbps',
   SLOWLOG_LAST_ID = 'slowlog_last_id',
   ACL_DENIED = 'acl_denied',
+  /** Repeated authentication failures from one client address, from ACL LOG (valkey#334) — state-based. */
+  AUTH_FAILURE_BURST = 'auth_failure_burst',
   /** New connections refused because maxclients was hit — per-poll delta of INFO stats rejected_connections. */
   REJECTED_CONNECTIONS = 'rejected_connections',
   /** connected_clients / maxclients saturation — state-based, emitted directly (not z-score buffered). */
   CLIENT_SATURATION = 'client_saturation',
+  /** Sustained connected_clients/maxclients pressure tied to live connection refusals — admin-lockout risk (valkey#3944) — state-based. */
+  CLIENT_LOCKOUT_RISK = 'client_lockout_risk',
   /** Clients disconnected by maxmemory-clients eviction — per-poll delta of INFO stats evicted_clients (valkey#4151). */
   EVICTED_CLIENTS = 'evicted_clients',
   /** Raft cluster (Cluster V2) health: leaderless/quorum-loss and election churn — state-based. */
@@ -54,6 +58,10 @@ export enum MetricType {
   SLOWLOG_COUNT = 'slowlog_count',
   /** A curated critical config key (maxmemory, maxmemory-policy, ...) differs across nodes in the same replication group (valkey#1193) — state-based. */
   CONFIG_DRIFT = 'config_drift',
+  /** ACL ruleset digest differs across nodes in the same replication group, or changed unexpectedly on one node (valkey#4355) — state-based. */
+  ACL_DRIFT = 'acl_drift',
+  /** Sentinel carries a replica/master under a raw IP where the group announces hostnames, or a node replicating from itself (valkey#2158) — state-based. */
+  SENTINEL_ENDPOINT_DRIFT = 'sentinel_endpoint_drift',
 }
 
 /**
@@ -79,6 +87,10 @@ export const METRICS_HANDLED_OUTSIDE_EXTRACTOR: ReadonlySet<MetricType> = new Se
   MetricType.SLOWLOG_LAST_ID,
   MetricType.REJECTED_CONNECTIONS,
   MetricType.CLIENT_SATURATION,
+  MetricType.CLIENT_LOCKOUT_RISK,
+  MetricType.AUTH_FAILURE_BURST,
+  MetricType.ACL_DRIFT,
+  MetricType.SENTINEL_ENDPOINT_DRIFT,
   MetricType.EVICTED_CLIENTS,
   MetricType.RAFT_HEALTH,
   MetricType.FAILOVER_CHURN,

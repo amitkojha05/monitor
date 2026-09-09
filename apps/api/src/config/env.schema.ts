@@ -1,4 +1,6 @@
 import { z } from 'zod';
+import { MAX_RETENTION_DAYS, parseRetentionDaysToken } from '@betterdb/shared';
+import { isCloudModeValue } from '../common/utils/cloud-mode';
 
 /**
  * Environment variable validation schema
@@ -18,8 +20,9 @@ export const envSchema = z
     DB_TYPE: z.enum(['valkey', 'redis', 'auto']).default('auto'),
 
     // Storage configuration
-    STORAGE_TYPE: z.enum(['sqlite', 'postgres', 'postgresql', 'memory']).default('sqlite'),
+    STORAGE_TYPE: z.enum(['sqlite', 'postgres', 'postgresql', 'turso', 'memory']).default('sqlite'),
     STORAGE_URL: z.string().url().optional(),
+    STORAGE_AUTH_TOKEN: z.string().optional(),
     STORAGE_SQLITE_FILEPATH: z.string().default('./data/audit.db'),
     DB_SCHEMA: z
       .string()
@@ -35,6 +38,21 @@ export const envSchema = z
     CLIENT_ANALYTICS_POLL_INTERVAL_MS: z.coerce.number().int().min(1000).default(60000),
     AI_OBS_POLL_INTERVAL_MS: z.coerce.number().int().min(1000).default(15000),
 
+    // Self-hosted data retention: days of monitoring history to keep. Seeds
+    // the localRetentionDays app setting when the settings row is first
+    // created; unset means keep forever. Ignored in cloud mode.
+    // Uses the same strict validator as the runtime seeding path, so a value
+    // like "1e2" fails at boot instead of passing here and silently seeding
+    // null later.
+    // A present-but-blank value (LOCAL_RETENTION_DAYS= in an .env file) means
+    // unset/keep-forever, not a validation failure.
+    LOCAL_RETENTION_DAYS: z
+      .string()
+      .optional()
+      .refine((v) => v === undefined || v.trim() === '' || parseRetentionDaysToken(v) !== null, {
+        message: `LOCAL_RETENTION_DAYS must be a whole number of days between 1 and ${MAX_RETENTION_DAYS}`,
+      }),
+
     // AI configuration
     AI_ENABLED: z
       .string()
@@ -48,6 +66,24 @@ export const envSchema = z
       .transform((v) => v === 'true'),
     LANCEDB_PATH: z.string().default('./data/lancedb'),
     VALKEY_DOCS_PATH: z.string().default('./data/valkey-docs'),
+
+    // CVE inspection (advisory refresh + per-connection scanning)
+    CVE_ENABLED: z
+      .string()
+      .default('true')
+      .transform((v) => v !== 'false'),
+    CVE_GITHUB_TOKEN: z
+      .string()
+      .optional()
+      .transform((value) => {
+        const trimmed = value?.trim();
+
+        if (trimmed === undefined || trimmed.length === 0) {
+          return undefined;
+        }
+
+        return trimmed;
+      }),
 
     // Anomaly detection
     ANOMALY_DETECTION_ENABLED: z
@@ -150,6 +186,48 @@ export const envSchema = z
       });
     }
 
+    // Require STORAGE_URL when using turso
+    if (data.STORAGE_TYPE === 'turso' && !data.STORAGE_URL) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: 'STORAGE_URL is required when STORAGE_TYPE is turso',
+        path: ['STORAGE_URL'],
+      });
+    }
+
+    // Validate STORAGE_URL is a libSQL connection string when using turso
+    if (data.STORAGE_TYPE === 'turso' && data.STORAGE_URL) {
+      const isLibsqlUrl =
+        data.STORAGE_URL.startsWith('libsql://') ||
+        data.STORAGE_URL.startsWith('https://') ||
+        data.STORAGE_URL.startsWith('http://');
+      if (!isLibsqlUrl) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message:
+            'STORAGE_URL must be a valid libSQL connection string (libsql://, https:// or http://)',
+          path: ['STORAGE_URL'],
+        });
+      }
+      if (data.STORAGE_URL.startsWith('libsql://') && !data.STORAGE_AUTH_TOKEN) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: 'STORAGE_AUTH_TOKEN is required when STORAGE_URL uses libsql://',
+          path: ['STORAGE_AUTH_TOKEN'],
+        });
+      }
+      if (data.STORAGE_URL.startsWith('http://') && data.STORAGE_AUTH_TOKEN) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message:
+            'STORAGE_AUTH_TOKEN cannot be used with an http:// STORAGE_URL: the token ' +
+            'would cross the network in cleartext. Use https:// or libsql://, or drop ' +
+            'the token for an unauthenticated local endpoint',
+          path: ['STORAGE_URL'],
+        });
+      }
+    }
+
     // Validate STORAGE_URL is a valid postgres URL when provided
     if (
       data.STORAGE_URL &&
@@ -181,7 +259,7 @@ export const envSchema = z
     // In cloud mode the OTLP ingest path is allowlisted past session auth, so the
     // bearer token is the only credential guarding it. Require it rather than
     // leaving a tenant's span store open to anonymous writes.
-    if (data.CLOUD_MODE === 'true' && !data.OTEL_INGEST_TOKEN) {
+    if (isCloudModeValue(data.CLOUD_MODE) && !data.OTEL_INGEST_TOKEN) {
       ctx.addIssue({
         code: z.ZodIssueCode.custom,
         message:

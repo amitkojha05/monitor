@@ -1,6 +1,10 @@
 import Valkey from 'iovalkey';
+import { randomUUID } from 'crypto';
 import { Logger } from '@nestjs/common';
-import { DatabasePort, DatabaseCapabilities } from '../../common/interfaces/database-port.interface';
+import {
+  DatabasePort,
+  DatabaseCapabilities,
+} from '../../common/interfaces/database-port.interface';
 import { InfoParser } from '../parsers/info.parser';
 import { MetricsParser } from '../parsers/metrics.parser';
 import { CLUSTER_TOTAL_SLOTS } from '../../common/constants/cluster.constants';
@@ -26,14 +30,28 @@ import {
   VectorSearchResult,
   TextSearchResult,
   ProfileResult,
+  SentinelNodeInfo,
 } from '../../common/types/metrics.types';
 import {
-  parseVectorIndexInfo, parseVectorSearchResponse, parseTextSearchResponse,
-  parseSearchConfig, parseProfileResponse,
-  sanitizeFilter, FIELD_NAME_RE, INDEX_NAME_RE,
+  parseVectorIndexInfo,
+  parseVectorSearchResponse,
+  parseTextSearchResponse,
+  parseSearchConfig,
+  parseProfileResponse,
+  sanitizeFilter,
+  FIELD_NAME_RE,
+  INDEX_NAME_RE,
 } from '../parsers/vector-index.parser';
-import type { KeyAnalyticsOptions, KeyAnalyticsResult, KeyDetail, KeyPatternData } from '@betterdb/shared';
+import type {
+  KeyAnalyticsOptions,
+  KeyAnalyticsResult,
+  KeyDetail,
+  KeyPatternData,
+} from '@betterdb/shared';
 import { extractPattern, pruneKeyDetails, KEY_DETAILS_PRUNE_AT } from '@betterdb/shared';
+
+import type { SshTunnelConfig } from '@betterdb/shared';
+import { SshTunnelService } from '../ssh/ssh-tunnel.service';
 
 export interface UnifiedDatabaseAdapterConfig {
   host: string;
@@ -42,6 +60,12 @@ export interface UnifiedDatabaseAdapterConfig {
   password: string;
   connectionName?: string;
   tls?: boolean;
+  /** Optional SSH tunnel used to reach the database (secrets already decrypted). */
+  sshTunnel?: SshTunnelConfig;
+  /** Tunnel manager; required when sshTunnel is enabled. */
+  sshTunnelService?: SshTunnelService;
+  /** Stable id used to key the tunnel (defaults to a generated id). */
+  connectionId?: string;
 }
 
 function isIpAddress(host: string): boolean {
@@ -51,16 +75,43 @@ function isIpAddress(host: string): boolean {
 
 export class UnifiedDatabaseAdapter implements DatabasePort {
   private readonly logger = new Logger(UnifiedDatabaseAdapter.name);
-  private client: Valkey;
+  // Backing field is genuinely nullable: a tunnelled adapter has no client
+  // until connect() runs, and teardown discards it. Every internal read goes
+  // through the `client` getter below, which throws a clear error instead of
+  // letting an undefined slip through to a TypeError deep in a query method.
+  private _client: Valkey | null = null;
+  private get client(): Valkey {
+    if (!this._client) {
+      throw new Error(
+        'Database connection is not established (no active client). ' +
+          'The server may be unreachable or its SSH tunnel may be down.',
+      );
+    }
+    return this._client;
+  }
   private connected: boolean = false;
   private capabilities: DatabaseCapabilities | null = null;
   private readonly config: UnifiedDatabaseAdapterConfig;
   private cliClient: Valkey | null = null;
+  private readonly connectionId: string;
+  // Unique per adapter instance so two adapters sharing a connectionId (e.g.
+  // the old and new adapter during reconnect) never collide on the same tunnel.
+  private readonly tunnelKey: string;
+  private readonly usesTunnel: boolean;
+  private tunnelActive: boolean = false;
+  // SHA256 fingerprint the SSH server presented, captured on first connect when
+  // no fingerprint was pinned (trust-on-first-use). The registry reads this back
+  // after a successful connect to persist it for subsequent verification.
+  private observedHostKeyFingerprint?: string;
+  // Host/port the Valkey clients actually dial. Rewritten to 127.0.0.1:<localPort>
+  // once an SSH tunnel is established.
+  private connectHost: string;
+  private connectPort: number;
 
   private createValkeyClient(connectionName: string): Valkey {
     return new Valkey({
-      host: this.config.host,
-      port: this.config.port,
+      host: this.connectHost,
+      port: this.connectPort,
       username: this.config.username,
       password: this.config.password,
       lazyConnect: true,
@@ -70,7 +121,8 @@ export class UnifiedDatabaseAdapter implements DatabasePort {
       // SNI-routed endpoints (e.g. Traefik HostSNI in front of managed Valkey)
       // would otherwise get the default cert and a non-RESP response
       // ("Protocol error, got 'H'"). Send the hostname as servername unless it
-      // is a bare IP, which SNI does not allow.
+      // is a bare IP, which SNI does not allow. Through a tunnel the socket
+      // points at localhost, but the certificate is still for the real host.
       tls: this.config.tls
         ? isIpAddress(this.config.host)
           ? {}
@@ -79,26 +131,136 @@ export class UnifiedDatabaseAdapter implements DatabasePort {
     });
   }
 
-  constructor(config: UnifiedDatabaseAdapterConfig) {
-    this.config = config;
-    this.client = this.createValkeyClient(config.connectionName ?? 'BetterDB-Monitor');
+  private initClient(): void {
+    const client = this.createValkeyClient(this.config.connectionName ?? 'BetterDB-Monitor');
+    this._client = client;
 
-    this.client.on('connect', () => {
+    // Identity-guard the state writes: iovalkey emits `close` asynchronously
+    // after disconnect(), so a discarded client can fire after a fresh client
+    // has already connected. Without the guard, that stale `close` would flip
+    // `connected` to false on a healthy connection.
+    client.on('connect', () => {
+      if (this._client !== client) return;
       this.connected = true;
     });
 
-    this.client.on('error', (err) => {
+    client.on('error', (err) => {
       this.logger.error(`Connection error: ${err.message}`);
+      if (this._client !== client) return;
       this.connected = false;
     });
 
-    this.client.on('close', () => {
+    client.on('close', () => {
+      if (this._client !== client) return;
       this.connected = false;
     });
   }
 
+  constructor(config: UnifiedDatabaseAdapterConfig) {
+    this.config = config;
+    this.connectionId = config.connectionId ?? `conn:${config.host}:${config.port}`;
+    this.tunnelKey = `${this.connectionId}:${randomUUID()}`;
+    this.usesTunnel = !!config.sshTunnel?.enabled;
+    this.connectHost = config.host;
+    this.connectPort = config.port;
+
+    if (this.usesTunnel && !config.sshTunnelService) {
+      throw new Error('sshTunnelService is required when an SSH tunnel is configured');
+    }
+
+    // Without a tunnel, create the client eagerly (existing behaviour). With a
+    // tunnel we must open the tunnel first (async) to know the local port, so
+    // the client is created in connect().
+    if (!this.usesTunnel) {
+      this.initClient();
+    }
+  }
+
+  private async establishTunnel(): Promise<void> {
+    const tunnel = this.config.sshTunnel!;
+    const service = this.config.sshTunnelService!;
+    const localPort = await service.createTunnel(this.tunnelKey, {
+      sshHost: tunnel.host,
+      sshPort: tunnel.port,
+      sshUsername: tunnel.username,
+      authMethod: tunnel.authMethod,
+      password: tunnel.password,
+      keySource: tunnel.keySource,
+      privateKey: tunnel.privateKey,
+      privateKeyPath: tunnel.privateKeyPath,
+      passphrase: tunnel.passphrase,
+      hostKeyFingerprint: tunnel.hostKeyFingerprint,
+      // Trust-on-first-use: record the key the server presents so the registry
+      // can persist it and pin it on the next connect.
+      onHostKey: (fingerprint) => {
+        this.observedHostKeyFingerprint = fingerprint;
+      },
+      // If the tunnel drops on its own, stop dialing the dead local port.
+      onUnexpectedClose: () => this.handleTunnelDropped(),
+      remoteHost: this.config.host,
+      remotePort: this.config.port,
+    });
+    this.connectHost = '127.0.0.1';
+    this.connectPort = localPort;
+    this.tunnelActive = true;
+  }
+
+  /**
+   * Called when the SSH tunnel drops unexpectedly. Discards the client (so
+   * iovalkey stops retrying the now-dead loopback port, whose number the OS may
+   * reassign to another process) and resets state so the next connect()
+   * re-establishes the tunnel.
+   */
+  private handleTunnelDropped(): void {
+    if (!this.tunnelActive) {
+      return;
+    }
+    this.logger.warn('SSH tunnel dropped; marking connection down until re-established');
+    this.tunnelActive = false;
+    this.connected = false;
+    if (this._client) {
+      this._client.disconnect();
+      this._client = null;
+    }
+    // The CLI client rode the same tunnel, so it now points at the dead local
+    // port too. Discard it so getCliClient() rebuilds it after re-establish.
+    if (this.cliClient) {
+      this.cliClient.disconnect();
+      this.cliClient = null;
+    }
+    this.connectHost = this.config.host;
+    this.connectPort = this.config.port;
+  }
+
+  private async teardownTunnel(): Promise<void> {
+    if (this.tunnelActive && this.config.sshTunnelService) {
+      await this.config.sshTunnelService.closeTunnel(this.tunnelKey).catch(() => {});
+      this.tunnelActive = false;
+      // The current client's options still point at the now-closed local port,
+      // so it must be rebuilt (against a freshly established tunnel) before the
+      // next connect(). Discard it and restore the pre-tunnel target.
+      if (this._client) {
+        this._client.disconnect();
+        this._client = null;
+      }
+      this.connectHost = this.config.host;
+      this.connectPort = this.config.port;
+    }
+  }
+
+  /** The host-key fingerprint observed on connect, if learned via TOFU. */
+  getObservedHostKeyFingerprint(): string | undefined {
+    return this.observedHostKeyFingerprint;
+  }
+
   async connect(): Promise<void> {
     try {
+      if (this.usesTunnel && !this.tunnelActive) {
+        await this.establishTunnel();
+      }
+      if (!this._client) {
+        this.initClient();
+      }
       this.logger.log(`Connecting to ${this.client.options.host}:${this.client.options.port}...`);
       await this.client.connect();
       this.connected = true;
@@ -107,6 +269,7 @@ export class UnifiedDatabaseAdapter implements DatabasePort {
       this.logger.log(`Detected ${this.capabilities?.dbType} ${this.capabilities?.version}`);
     } catch (error) {
       this.connected = false;
+      await this.teardownTunnel();
       this.logger.error(`Connection failed: ${error instanceof Error ? error.message : error}`);
       throw error;
     }
@@ -117,12 +280,20 @@ export class UnifiedDatabaseAdapter implements DatabasePort {
       await this.cliClient.quit().catch(() => {});
       this.cliClient = null;
     }
-    await this.client.quit();
+    if (this._client) {
+      // iovalkey rejects quit() when the client is already closed / never
+      // connected. Swallow it (falling back to a hard disconnect) so a failed
+      // quit can never skip the tunnel teardown below and leak the SSH session.
+      await this._client.quit().catch(() => {
+        this._client?.disconnect();
+      });
+    }
+    await this.teardownTunnel();
     this.connected = false;
   }
 
   isConnected(): boolean {
-    return this.connected && this.client.status === 'ready';
+    return this.connected && this._client?.status === 'ready';
   }
 
   async ping(): Promise<boolean> {
@@ -141,9 +312,7 @@ export class UnifiedDatabaseAdapter implements DatabasePort {
       // feature — Redis <7 and forks like KeyDB reject it with "ERR syntax
       // error" (breaks e.g. KeyDB→Valkey migration analysis). Fetch each section
       // separately (single-section INFO is universal) and concatenate.
-      const parts = await Promise.all(
-        sections.map((section) => this.client.info(section)),
-      );
+      const parts = await Promise.all(sections.map((section) => this.client.info(section)));
       infoString = parts.join('\n');
     } else if (sections && sections.length === 1) {
       infoString = await this.client.info(sections[0]);
@@ -173,7 +342,8 @@ export class UnifiedDatabaseAdapter implements DatabasePort {
     const majorVersion = versionParts[0] || 0;
     const minorVersion = versionParts[1] || 0;
 
-    const redisSupportsSlotStats = !isValkey && (majorVersion > 8 || (majorVersion === 8 && minorVersion >= 2));
+    const redisSupportsSlotStats =
+      !isValkey && (majorVersion > 8 || (majorVersion === 8 && minorVersion >= 2));
 
     // Probe whether CONFIG is available (disabled on managed services like AWS ElastiCache)
     let hasConfig = true;
@@ -181,7 +351,9 @@ export class UnifiedDatabaseAdapter implements DatabasePort {
       await this.client.config('GET', 'maxmemory');
     } catch {
       hasConfig = false;
-      this.logger.warn('CONFIG command is not available (common on managed Redis services like AWS ElastiCache). Config monitoring will be disabled.');
+      this.logger.warn(
+        'CONFIG command is not available (common on managed Redis services like AWS ElastiCache). Config monitoring will be disabled.',
+      );
     }
 
     // Probe whether FT._LIST is available (Search module loaded)
@@ -199,7 +371,7 @@ export class UnifiedDatabaseAdapter implements DatabasePort {
       dbType: isValkey ? 'valkey' : 'redis',
       version,
       hasSlotStats: (isValkey && majorVersion >= 8) || redisSupportsSlotStats,
-      hasCommandLog: isValkey && (majorVersion > 8 || (majorVersion === 8 && minorVersion >= 1)),  // Still Valkey-only
+      hasCommandLog: isValkey && (majorVersion > 8 || (majorVersion === 8 && minorVersion >= 1)), // Still Valkey-only
       hasClusterSlotStats: (isValkey && majorVersion >= 8) || redisSupportsSlotStats,
       hasLatencyMonitor: true,
       hasAclLog: majorVersion >= 6,
@@ -221,20 +393,20 @@ export class UnifiedDatabaseAdapter implements DatabasePort {
     endTime?: number,
   ): Promise<SlowLogEntry[]> {
     // Fetch more entries if filtering to ensure we return enough results
-    const fetchCount = (excludeClientName || startTime || endTime) ? count * 5 : count;
+    const fetchCount = excludeClientName || startTime || endTime ? count * 5 : count;
     const rawLog = await this.client.slowlog('GET', fetchCount);
     let entries = MetricsParser.parseSlowLog(rawLog as unknown[]);
 
     // Filter out entries from specified client (e.g., monitor's own commands)
     if (excludeClientName) {
-      entries = entries.filter(entry => entry.clientName !== excludeClientName);
+      entries = entries.filter((entry) => entry.clientName !== excludeClientName);
     }
 
     if (startTime) {
-      entries = entries.filter(entry => entry.timestamp >= startTime);
+      entries = entries.filter((entry) => entry.timestamp >= startTime);
     }
     if (endTime) {
-      entries = entries.filter(entry => entry.timestamp <= endTime);
+      entries = entries.filter((entry) => entry.timestamp <= endTime);
     }
 
     return entries.slice(0, count);
@@ -310,7 +482,10 @@ export class UnifiedDatabaseAdapter implements DatabasePort {
   }
 
   async getLatencyHistogram(commands?: string[]): Promise<Record<string, LatencyHistogram>> {
-    const args: string[] = commands && commands.length > 0 ? ['LATENCY', 'HISTOGRAM', ...commands] : ['LATENCY', 'HISTOGRAM'];
+    const args: string[] =
+      commands && commands.length > 0
+        ? ['LATENCY', 'HISTOGRAM', ...commands]
+        : ['LATENCY', 'HISTOGRAM'];
     const rawData = await this.client.call(...(args as [string, ...string[]]));
 
     const result: Record<string, LatencyHistogram> = {};
@@ -473,6 +648,27 @@ export class UnifiedDatabaseAdapter implements DatabasePort {
     }
   }
 
+  /**
+   * `SENTINEL MASTERS` — every master this Sentinel monitors, with the address
+   * Sentinel currently has recorded for each.
+   */
+  async getSentinelMasters(): Promise<SentinelNodeInfo[]> {
+    const raw = await this.client.call('SENTINEL', 'MASTERS');
+    return MetricsParser.parseSentinelNodes(raw as unknown[]);
+  }
+
+  /** `SENTINEL REPLICAS <master>` — the replicas Sentinel believes follow a master. */
+  async getSentinelReplicas(masterName: string): Promise<SentinelNodeInfo[]> {
+    const raw = await this.client.call('SENTINEL', 'REPLICAS', masterName);
+    return MetricsParser.parseSentinelNodes(raw as unknown[]);
+  }
+
+  /** `SENTINEL SENTINELS <master>` — the other Sentinels monitoring a master. */
+  async getSentinelPeers(masterName: string): Promise<SentinelNodeInfo[]> {
+    const raw = await this.client.call('SENTINEL', 'SENTINELS', masterName);
+    return MetricsParser.parseSentinelNodes(raw as unknown[]);
+  }
+
   async getClusterInfo(): Promise<Record<string, string>> {
     const infoString = await this.client.call('CLUSTER', 'INFO');
     const lines = (infoString as string).trim().split('\n');
@@ -503,7 +699,10 @@ export class UnifiedDatabaseAdapter implements DatabasePort {
     return MetricsParser.parseClusterShards(raw as unknown[]);
   }
 
-  async getClusterSlotStats(orderBy: 'key-count' | 'cpu-usec' = 'key-count', limit: number = 100): Promise<SlotStats> {
+  async getClusterSlotStats(
+    orderBy: 'key-count' | 'cpu-usec' = 'key-count',
+    limit: number = 100,
+  ): Promise<SlotStats> {
     if (!this.capabilities?.hasClusterSlotStats) {
       throw new Error('CLUSTER SLOT-STATS not supported on this database version');
     }
@@ -511,7 +710,14 @@ export class UnifiedDatabaseAdapter implements DatabasePort {
     // Validate and clamp limit to valid range (1 to total cluster slots)
     const validLimit = Math.max(1, Math.min(limit, CLUSTER_TOTAL_SLOTS));
 
-    const rawStats = await this.client.call('CLUSTER', 'SLOT-STATS', 'ORDERBY', orderBy, 'LIMIT', validLimit);
+    const rawStats = await this.client.call(
+      'CLUSTER',
+      'SLOT-STATS',
+      'ORDERBY',
+      orderBy,
+      'LIMIT',
+      validLimit,
+    );
     return MetricsParser.parseSlotStats(rawStats as unknown[]);
   }
 
@@ -586,8 +792,17 @@ export class UnifiedDatabaseAdapter implements DatabasePort {
 
           const results = (await pipeline.exec()) || [];
           const [
-            memResult, idleResult, freqResult, ttlResult, typeResult,
-            strlenResult, llenResult, hlenResult, scardResult, zcardResult, xlenResult,
+            memResult,
+            idleResult,
+            freqResult,
+            ttlResult,
+            typeResult,
+            strlenResult,
+            llenResult,
+            hlenResult,
+            scardResult,
+            zcardResult,
+            xlenResult,
           ] = results;
 
           stats.count++;
@@ -595,33 +810,53 @@ export class UnifiedDatabaseAdapter implements DatabasePort {
           const num = (r: [Error | null, unknown] | undefined): number | null =>
             r && !r[0] && r[1] != null ? (r[1] as number) : null;
 
-          const mem = (memResult && !memResult[0] && memResult[1] != null) ? memResult[1] as number : null;
+          const mem =
+            memResult && !memResult[0] && memResult[1] != null ? (memResult[1] as number) : null;
           if (mem !== null) {
             stats.totalMemory += mem;
             if (mem > stats.maxMemory) stats.maxMemory = mem;
           }
 
-          const keyType = (typeResult && !typeResult[0] && typeResult[1] != null) ? String(typeResult[1]) : null;
+          const keyType =
+            typeResult && !typeResult[0] && typeResult[1] != null ? String(typeResult[1]) : null;
           let cardinality: number | null = null;
           switch (keyType) {
-            case 'string': cardinality = num(strlenResult); break;
-            case 'list': cardinality = num(llenResult); break;
-            case 'hash': cardinality = num(hlenResult); break;
-            case 'set': cardinality = num(scardResult); break;
-            case 'zset': cardinality = num(zcardResult); break;
-            case 'stream': cardinality = num(xlenResult); break;
+            case 'string':
+              cardinality = num(strlenResult);
+              break;
+            case 'list':
+              cardinality = num(llenResult);
+              break;
+            case 'hash':
+              cardinality = num(hlenResult);
+              break;
+            case 'set':
+              cardinality = num(scardResult);
+              break;
+            case 'zset':
+              cardinality = num(zcardResult);
+              break;
+            case 'stream':
+              cardinality = num(xlenResult);
+              break;
           }
           if (cardinality !== null) {
             stats.totalCardinality += cardinality;
             if (cardinality > stats.maxCardinality) stats.maxCardinality = cardinality;
           }
 
-          const idle = (idleResult && !idleResult[0] && idleResult[1] != null) ? idleResult[1] as number : null;
+          const idle =
+            idleResult && !idleResult[0] && idleResult[1] != null
+              ? (idleResult[1] as number)
+              : null;
           if (idle !== null) {
             stats.totalIdleTime += idle;
           }
 
-          const freq = (freqResult && !freqResult[0] && freqResult[1] != null) ? freqResult[1] as number : null;
+          const freq =
+            freqResult && !freqResult[0] && freqResult[1] != null
+              ? (freqResult[1] as number)
+              : null;
           if (freq !== null) {
             stats.accessFrequencies.push(freq);
           }
@@ -669,20 +904,26 @@ export class UnifiedDatabaseAdapter implements DatabasePort {
 
   async getVectorIndexList(): Promise<string[]> {
     if (!this.capabilities?.hasVectorSearch) {
-      throw new Error('Vector search is not available on this connection (Search module not loaded)');
+      throw new Error(
+        'Vector search is not available on this connection (Search module not loaded)',
+      );
     }
     try {
       const result = await this.client.call('FT._LIST');
       return (result as string[]) || [];
     } catch (error) {
-      this.logger.error(`Failed to list vector indexes: ${error instanceof Error ? error.message : error}`);
+      this.logger.error(
+        `Failed to list vector indexes: ${error instanceof Error ? error.message : error}`,
+      );
       throw error;
     }
   }
 
   async getVectorIndexInfo(indexName: string): Promise<VectorIndexInfo> {
     if (!this.capabilities?.hasVectorSearch) {
-      throw new Error('Vector search is not available on this connection (Search module not loaded)');
+      throw new Error(
+        'Vector search is not available on this connection (Search module not loaded)',
+      );
     }
     if (!INDEX_NAME_RE.test(indexName)) {
       throw new Error(`Invalid index name: ${indexName}`);
@@ -691,7 +932,9 @@ export class UnifiedDatabaseAdapter implements DatabasePort {
       const raw = (await this.client.call('FT.INFO', indexName)) as unknown[];
       return parseVectorIndexInfo(indexName, raw);
     } catch (error) {
-      this.logger.error(`Failed to get vector index info for ${indexName}: ${error instanceof Error ? error.message : error}`);
+      this.logger.error(
+        `Failed to get vector index info for ${indexName}: ${error instanceof Error ? error.message : error}`,
+      );
       throw error;
     }
   }
@@ -708,7 +951,9 @@ export class UnifiedDatabaseAdapter implements DatabasePort {
     filter?: string,
   ): Promise<VectorSearchResult[]> {
     if (!this.capabilities?.hasVectorSearch) {
-      throw new Error('Vector search is not available on this connection (Search module not loaded)');
+      throw new Error(
+        'Vector search is not available on this connection (Search module not loaded)',
+      );
     }
     if (!INDEX_NAME_RE.test(indexName)) {
       throw new Error(`Invalid index name: ${indexName}`);
@@ -733,9 +978,16 @@ export class UnifiedDatabaseAdapter implements DatabasePort {
     return parseVectorSearchResponse(result, vectorFieldName);
   }
 
-  async textSearch(indexName: string, query: string, offset = 0, limit = 20): Promise<TextSearchResult> {
+  async textSearch(
+    indexName: string,
+    query: string,
+    offset = 0,
+    limit = 20,
+  ): Promise<TextSearchResult> {
     if (!this.capabilities?.hasVectorSearch) {
-      throw new Error('Vector search is not available on this connection (Search module not loaded)');
+      throw new Error(
+        'Vector search is not available on this connection (Search module not loaded)',
+      );
     }
     if (!INDEX_NAME_RE.test(indexName)) {
       throw new Error(`Invalid index name: ${indexName}`);
@@ -745,7 +997,14 @@ export class UnifiedDatabaseAdapter implements DatabasePort {
     }
     const clampedLimit = Math.min(Math.max(limit, 1), 100);
     const clampedOffset = Math.max(offset, 0);
-    const args: string[] = ['FT.SEARCH', indexName, query, 'LIMIT', String(clampedOffset), String(clampedLimit)];
+    const args: string[] = [
+      'FT.SEARCH',
+      indexName,
+      query,
+      'LIMIT',
+      String(clampedOffset),
+      String(clampedLimit),
+    ];
     // DIALECT 2 is needed for RediSearch modern query syntax but not supported by Valkey Search
     if (this.capabilities?.dbType === 'redis') {
       args.push('DIALECT', '2');
@@ -756,7 +1015,9 @@ export class UnifiedDatabaseAdapter implements DatabasePort {
 
   async getTagValues(indexName: string, fieldName: string): Promise<string[]> {
     if (!this.capabilities?.hasVectorSearch) {
-      throw new Error('Vector search is not available on this connection (Search module not loaded)');
+      throw new Error(
+        'Vector search is not available on this connection (Search module not loaded)',
+      );
     }
     if (!INDEX_NAME_RE.test(indexName)) {
       throw new Error(`Invalid index name: ${indexName}`);
@@ -780,7 +1041,7 @@ export class UnifiedDatabaseAdapter implements DatabasePort {
         const values = new Set<string>();
         for (const doc of result.results) {
           const v = doc.fields[fieldName];
-          if (v) v.split(',').forEach(tag => values.add(tag.trim()));
+          if (v) v.split(',').forEach((tag) => values.add(tag.trim()));
         }
         return [...values].sort();
       } catch {
@@ -792,7 +1053,9 @@ export class UnifiedDatabaseAdapter implements DatabasePort {
 
   async getSearchConfig(pattern?: string): Promise<Record<string, string>> {
     if (!this.capabilities?.hasVectorSearch) {
-      throw new Error('Vector search is not available on this connection (Search module not loaded)');
+      throw new Error(
+        'Vector search is not available on this connection (Search module not loaded)',
+      );
     }
     try {
       const raw = await this.client.call('FT.CONFIG', 'GET', pattern || '*');
@@ -805,7 +1068,9 @@ export class UnifiedDatabaseAdapter implements DatabasePort {
 
   async profileSearch(indexName: string, query: string, limited = false): Promise<ProfileResult> {
     if (!this.capabilities?.hasVectorSearch) {
-      throw new Error('Vector search is not available on this connection (Search module not loaded)');
+      throw new Error(
+        'Vector search is not available on this connection (Search module not loaded)',
+      );
     }
     if (!INDEX_NAME_RE.test(indexName)) {
       throw new Error(`Invalid index name: ${indexName}`);
@@ -830,6 +1095,15 @@ export class UnifiedDatabaseAdapter implements DatabasePort {
       return this.cliClient;
     }
 
+    // After a tunnel drop, connectHost/connectPort are reset to the real
+    // (possibly bastion-only) database endpoint. Building a CLI client now would
+    // dial it directly and hang. Refuse until the tunnel is re-established.
+    if (this.usesTunnel && !this.tunnelActive) {
+      throw new Error(
+        'SSH tunnel is not established; reconnect the connection before running CLI commands.',
+      );
+    }
+
     this.cliClient = this.createValkeyClient('BetterDB-CLI');
     await this.cliClient.connect();
     this.logger.log('CLI client connected');
@@ -845,6 +1119,8 @@ export class UnifiedDatabaseAdapter implements DatabasePort {
   }
 
   getClient(): Valkey {
+    // Throws a clear "connection not established" error (via the getter) rather
+    // than handing back an undefined that blows up as a TypeError in the caller.
     return this.client;
   }
 }

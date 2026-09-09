@@ -2,6 +2,7 @@
 
 [![Docker Pulls](https://img.shields.io/docker/pulls/betterdb/monitor)](https://hub.docker.com/r/betterdb/monitor)
 [![Docker Image Version](https://img.shields.io/docker/v/betterdb/monitor?sort=semver&label=docker)](https://hub.docker.com/r/betterdb/monitor/tags)
+[![Artifact Hub](https://img.shields.io/endpoint?url=https://artifacthub.io/badge/repository/betterdb-monitor)](https://artifacthub.io/packages/search?repo=betterdb-monitor)
 [![npm](https://img.shields.io/npm/v/%40betterdb%2Fmonitor?label=npm)](https://www.npmjs.com/package/@betterdb/monitor)
 [![npm downloads](https://img.shields.io/npm/dm/%40betterdb%2Fmonitor)](https://www.npmjs.com/package/@betterdb/monitor)
 [![API Tests](https://github.com/betterdb-inc/monitor/actions/workflows/api-tests.yml/badge.svg)](https://github.com/betterdb-inc/monitor/actions/workflows/api-tests.yml)
@@ -54,6 +55,19 @@ Two image variants are published, both multi-arch (`linux/amd64`, `linux/arm64`)
 
 See [Docker Production Deployment](#docker-production-deployment) for persistent storage, custom ports, licensing, and air-gapped setups.
 
+## Quick Start (Kubernetes / Helm)
+
+```bash
+helm repo add betterdb https://docs.betterdb.com/charts
+helm repo update
+helm install betterdb-monitor betterdb/betterdb-monitor \
+  --namespace betterdb --create-namespace \
+  --set db.host=my-valkey.default.svc.cluster.local \
+  --set db.password=yourpassword
+```
+
+Then `kubectl port-forward -n betterdb svc/betterdb-monitor 3001:3001` and open `http://localhost:3001`, or enable the chart's ingress. PostgreSQL-backed history, bring-your-own Secrets, and air-gapped licensing are all covered in the [Kubernetes guide](https://docs.betterdb.com/kubernetes) and the [chart README](charts/betterdb-monitor/README.md).
+
 ## Quick Start (CLI)
 
 Run BetterDB Monitor without Docker:
@@ -99,13 +113,13 @@ Requires Node.js >= 20.0.0 and a Valkey or Redis instance to monitor. For SQLite
 - **Vector search observability** - FT.SEARCH ops/sec and latency with per-index health for [valkey-search](https://github.com/valkey-io/valkey-search) and RediSearch. See [docs/vector-ai](docs/vector-ai/README.md).
 - **Inference latency** - p50/p95/p99 per index, with SLA breach alerts (Pro, free in early access).
 - **Semantic cache intelligence** (Pro, free in early access) - hit-rate health, similarity-threshold recommendations, and an approve/reject proposal workflow. Agent memory observability included.
-- **AI traces** - OTLP span waterfalls from your AI application, correlated with the live Valkey state underneath each request.
+- **AI traces** - OTLP span waterfalls from your AI application, correlated with the live Valkey state underneath each request. See [docs/opentelemetry.md](docs/opentelemetry.md).
 
 ### Plugs into everything
 
 - **MCP server** - 60 tools for Claude Code, Cursor, or any MCP client via [`@betterdb/mcp`](packages/mcp).
 - **Prometheus endpoint** - 100+ `betterdb_*` metrics. See [docs/prometheus-metrics.md](docs/prometheus-metrics.md).
-- **OpenTelemetry** - mirror metrics and events to any OTLP backend.
+- **OpenTelemetry** - ingest OTLP traces, and mirror metrics and events to any OTLP backend. See [docs/opentelemetry.md](docs/opentelemetry.md).
 - **REST API** - everything in the UI is an API call, documented via OpenAPI.
 
 ## Access Your Data Your Way
@@ -199,9 +213,26 @@ docker run -d \
 | `BETTERDB_OFFLINE_LICENSE_FILE` | No | - | Path to a signed offline license `.jwt` for **air-gapped** hosts (see below) |
 | `BETTERDB_OFFLINE_LICENSE` | No | - | Offline license token as an inline JWT string |
 | `BETTERDB_DATA_DIR` | No | `/app/data` | Directory for persisted license state (mount a writable volume) |
+| `ENCRYPTION_KEY` | No | - | Key (min 16 chars) used to envelope-encrypt stored connection passwords and SSH tunnel secrets at rest. Without it, secrets are stored in plaintext |
+| `BETTERDB_SSH_KEY_DIR` | No | - | Directory that server-side SSH private keys must live in. Enables the "server file path" key source for [SSH tunnels](#ssh-tunnels); a connection's key path must resolve inside it. Unset disables file-based keys (inline pasted keys still work) |
 | `BETTERDB_TELEMETRY` | No | `true` | Set `false` to disable anonymous telemetry |
 
-Full reference, including AI, OTLP export, webhook tuning, and health-gate thresholds: [docs/configuration.md](docs/configuration.md).
+Full reference, including AI, webhook tuning, and health-gate thresholds: [docs/configuration.md](docs/configuration.md). For OTLP trace ingest and metrics/event export, see [docs/opentelemetry.md](docs/opentelemetry.md).
+
+### SSH Tunnels
+
+Connections can reach a database through an SSH bastion/jump host instead of connecting directly — useful for Valkey/Redis in a private subnet, ElastiCache, or MemoryDB. Enable **Connect via SSH tunnel** when adding a connection and provide the SSH host, port, and username. A single hop is supported.
+
+Authentication is either a password or a private key. Private keys come from one of two sources:
+
+- **Paste key** (inline): the PEM key content is submitted with the connection. It is stored encrypted at rest **only when `ENCRYPTION_KEY` is set** (envelope encryption); without that key it is stored in plaintext, like connection passwords. Works everywhere, including managed/cloud deployments.
+- **Server file path**: the key already lives on the monitor server's filesystem and is referenced by path. This requires setting the `BETTERDB_SSH_KEY_DIR` environment variable to the directory holding the allowed keys, and the referenced path must resolve inside it, so the API can never be coerced into reading arbitrary files. Leave `BETTERDB_SSH_KEY_DIR` unset to disable this option.
+
+Optionally pin the SSH server's **host key fingerprint** (`SHA256:...`) on the connection; when set, the tunnel is refused unless the server presents a matching key, preventing man-in-the-middle attacks on the bastion path. Left blank, the server identity is not verified (a warning is logged).
+
+The tunnel forwards to the database over `127.0.0.1`; when TLS is enabled the certificate is still validated against the real database hostname. Set `ENCRYPTION_KEY` so SSH passwords, key passphrases, and inline keys are encrypted at rest.
+
+**Known limitation — cluster/Sentinel topologies:** only the connection you configure is tunnelled. Cluster and Sentinel monitoring fan out to the other nodes using the addresses those nodes advertise (`CLUSTER NODES` / Sentinel), and those per-node connections are made directly, not through the tunnel. If the other nodes are only reachable via the bastion (e.g. ElastiCache/MemoryDB in a private subnet), per-node views will be unavailable. Use SSH tunnels for single-node/primary monitoring, or place the monitor where it can reach the cluster nodes directly.
 
 ### Licensing & Air-Gapped Support
 
@@ -278,13 +309,14 @@ docker rm betterdb-monitor             # remove
 
 ## Storage Backends
 
-BetterDB Monitor persists audit trail, analytics, captures, and anomaly data to one of three backends:
+BetterDB Monitor persists audit trail, analytics, captures, and anomaly data to one of four backends:
 
 | Backend | Use case | Notes |
 |---------|----------|-------|
 | `memory` | Testing, ephemeral environments | Default in Docker; all data lost on restart |
 | `postgres` | Production | `STORAGE_TYPE=postgres` + `STORAGE_URL=postgresql://user:pass@host:port/db` |
-| `sqlite` | Local development / CLI | Not included in Docker production images; `STORAGE_SQLITE_FILEPATH` optional |
+| `turso` | Production / serverless SQLite | `STORAGE_TYPE=turso` + `STORAGE_URL=libsql://...` + `STORAGE_AUTH_TOKEN`; works in Docker |
+| `sqlite` | Local development / CLI | Native module stripped from the `latest` Docker image; `STORAGE_SQLITE_FILEPATH` optional |
 
 ## Prometheus Metrics
 

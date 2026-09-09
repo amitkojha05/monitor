@@ -21,6 +21,7 @@ function mockGlobalSettings(overrides?: Partial<AppSettings>): AppSettings {
     metricForecastingDefaultAlertThresholdMs: 7200000,
     inferenceSlaConfig: {},
     anomalyDetectorConfig: {},
+    localRetentionDays: null,
     createdAt: Date.now(),
     updatedAt: Date.now(),
     ...overrides,

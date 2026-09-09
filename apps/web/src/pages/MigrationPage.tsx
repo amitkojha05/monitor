@@ -4,6 +4,9 @@ import { Feature } from '@betterdb/shared';
 import { fetchApi } from '../api/client';
 import { useLicense } from '../hooks/useLicense';
 import { AnalysisForm } from '../components/migration/AnalysisForm';
+import { Button } from '../components/ui/button';
+import { StepRail } from '../components/migration/StepRail';
+import { HowItWorks } from '../components/migration/analysis-form/HowItWorks';
 import { AnalysisProgressBar } from '../components/migration/AnalysisProgressBar';
 import { MigrationReport } from '../components/migration/MigrationReport';
 import { ExportBar } from '../components/migration/ExportBar';
@@ -22,9 +25,16 @@ function formatBytes(bytes: number): string {
 }
 
 function stepIndex(phase: Phase): number {
-  if (phase === 'idle') return 0;
-  if (phase === 'analyzing' || phase === 'analyzed') return 1;
-  return 2;
+  if (phase === 'idle') {
+    return 0;
+  }
+  if (phase === 'analyzing' || phase === 'analyzed') {
+    return 1;
+  }
+  if (phase === 'executing' || phase === 'executed') {
+    return 2;
+  }
+  return 3;
 }
 
 // ── Small shared components ──
@@ -37,43 +47,9 @@ function LockIcon() {
   );
 }
 
-const STEPS = ['Configure', 'Analyse', 'Migrate'] as const;
-
-function StepIndicator({ phase, onBack }: { phase: Phase; onBack?: () => void }) {
-  const current = stepIndex(phase);
-  return (
-    <nav className="flex items-center gap-2 text-sm mb-2">
-      {onBack && (
-        <button
-          onClick={onBack}
-          className="px-3 py-1 text-sm border rounded-md hover:bg-muted mr-2"
-        >
-          &larr; Change configuration
-        </button>
-      )}
-      {STEPS.map((label, i) => (
-        <span key={label} className="flex items-center gap-2">
-          {i > 0 && <span className="text-muted-foreground">&rarr;</span>}
-          <span
-            className={
-              i === current
-                ? 'font-semibold text-primary'
-                : i < current
-                  ? 'text-muted-foreground'
-                  : 'text-muted-foreground/50'
-            }
-          >
-            {i + 1}. {label}
-          </span>
-        </span>
-      ))}
-    </nav>
-  );
-}
-
 // ── Main page ──
 
-export function MigrationPage() {
+export function MigrationPage({ isCloudMode }: { isCloudMode: boolean }) {
   const [phase, setPhase] = useState<Phase>('idle');
   const [analysisId, setAnalysisId] = useState<string | null>(null);
   const [executionId, setExecutionId] = useState<string | null>(null);
@@ -101,10 +77,14 @@ export function MigrationPage() {
   const [history, setHistory] = useState<MigrationAnalysisResult[]>([]);
   const [expandedHistoryId, setExpandedHistoryId] = useState<string | null>(null);
 
-  // Scroll to validation section when it appears
+  // When validation starts, scroll the validation panel into view with the minimum
+  // movement needed ('nearest'), keeping its top — header and controls — anchored.
+  // 'end' aligned the panel's bottom to the viewport bottom, which pushed the header
+  // above the fold for any panel taller than the viewport (and, since the effect
+  // never re-runs, everything rendered afterwards grew off-screen below it).
   useEffect(() => {
     if (phase === 'validating') {
-      validationRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+      validationRef.current?.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
     }
   }, [phase]);
 
@@ -130,14 +110,15 @@ export function MigrationPage() {
     setShowConfirmDialog(true);
   };
 
-  // Issue 4: actual API call after user confirms
-  const handleConfirmMigration = async () => {
+  // Start (or re-start) execution. `forceEmptyDb` forces a target flush regardless of
+  // the checkbox — used by the BUSYKEY "Flush target & retry" affordance.
+  const startMigrationExecution = async (forceEmptyDb: boolean) => {
     if (!job?.sourceConnectionId || !job?.targetConnectionId) return;
     setMigrationStarting(true);
     try {
       const rsOptions: RedisShakeOptions = {};
       if (tryDiskless) rsOptions.tryDiskless = true;
-      if (emptyDbBeforeSync) rsOptions.emptyDbBeforeSync = true;
+      if (emptyDbBeforeSync || forceEmptyDb) rsOptions.emptyDbBeforeSync = true;
       const hasRsOptions = Object.keys(rsOptions).length > 0;
 
       const result = await fetchApi<{ id: string }>('/migration/execution', {
@@ -153,6 +134,7 @@ export function MigrationPage() {
         }),
       });
       setShowConfirmDialog(false);
+      setExecutionResult(null);
       setExecutionId(result.id);
       setPhase('executing');
     } catch (err: unknown) {
@@ -163,6 +145,11 @@ export function MigrationPage() {
       setMigrationStarting(false);
     }
   };
+
+  // Issue 4: actual API call after user confirms
+  const handleConfirmMigration = () => startMigrationExecution(false);
+  // Re-run after a BUSYKEY failure, flushing the target first.
+  const handleRetryWithFlush = () => startMigrationExecution(true);
 
   const handleStartValidation = async () => {
     if (!job?.sourceConnectionId || !job?.targetConnectionId) return;
@@ -186,19 +173,25 @@ export function MigrationPage() {
   };
 
   return (
-    <div className="space-y-6">
-      <div>
-        <h1 className="text-2xl font-bold">Migration</h1>
-        <p className="text-muted-foreground mt-1">
-          Analyze your source instance to assess migration readiness.
-        </p>
+    <div className="space-y-6 pb-24">
+      <div className="flex flex-wrap items-start justify-between gap-4">
+        <div>
+          <h1 className="text-2xl font-bold">Migration</h1>
+          <p className="text-muted-foreground mt-1">
+            Analyze your source instance to assess migration readiness.
+          </p>
+        </div>
+        {phase !== 'idle' && phase !== 'analyzing' && (
+          <Button variant="outline" size="sm" onClick={() => resetToIdle()}>
+            ← Change configuration
+          </Button>
+        )}
       </div>
 
-      {/* Issue 3: Step indicator */}
-      <StepIndicator
-        phase={phase}
-        onBack={phase !== 'idle' && phase !== 'analyzing' ? () => resetToIdle() : undefined}
-      />
+      {/* The rail and the step cards describe the same steps, so only one shows at
+          a time: the cards carry the illustrations that earn their space on the
+          opening screen, the rail carries progress once past it. */}
+      {stepIndex(phase) > 0 && <StepRail currentStep={stepIndex(phase)} />}
 
       {error && (
         <div className="bg-destructive/10 border border-destructive/20 text-destructive rounded-lg p-4">
@@ -209,6 +202,7 @@ export function MigrationPage() {
 
       {phase === 'idle' && (
         <AnalysisForm
+          isCloudMode={isCloudMode}
           onStart={(id) => {
             setAnalysisId(id);
             setPhase('analyzing');
@@ -358,6 +352,8 @@ export function MigrationPage() {
           <MigrationReport job={job} />
           <ExecutionPanel
             executionId={executionId}
+            onRetryFlush={handleRetryWithFlush}
+            retryPending={migrationStarting}
             onStopped={async () => {
               try {
                 const result = await fetchApi<MigrationExecutionResult>(`/migration/execution/${executionId}`);
@@ -374,6 +370,8 @@ export function MigrationPage() {
           <MigrationReport job={job} />
           <ExecutionPanel
             executionId={executionId}
+            onRetryFlush={handleRetryWithFlush}
+            retryPending={migrationStarting}
             onStopped={() => {/* already stopped */ }}
           />
 
@@ -531,6 +529,8 @@ export function MigrationPage() {
           </div>
         </div>
       )}
+
+      {stepIndex(phase) === 0 && <HowItWorks />}
 
       {/* Issue 15: Past analyses history */}
       {history.length > 0 && (

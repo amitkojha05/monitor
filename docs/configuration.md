@@ -147,11 +147,18 @@ This means:
 
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
-| `STORAGE_TYPE` | No | `memory` | Storage backend: `memory`, `postgres`, or `sqlite` |
-| `STORAGE_URL` | Conditional | - | PostgreSQL connection URL (required if `STORAGE_TYPE=postgres`) |
+| `STORAGE_TYPE` | No | `memory` | Storage backend: `memory`, `postgres`, `sqlite`, or `turso` |
+| `STORAGE_URL` | Conditional | - | PostgreSQL connection URL (required if `STORAGE_TYPE=postgres`), or libSQL URL (required if `STORAGE_TYPE=turso`) |
+| `STORAGE_AUTH_TOKEN` | Conditional | - | Turso auth token (startup requires it when `STORAGE_URL` uses `libsql://`, and rejects it when `STORAGE_URL` uses `http://`; a hosted `https://` endpoint needs it too but is not checked at startup - see below) |
 | `STORAGE_SQLITE_FILEPATH` | No | `./data/audit.db` | SQLite database file path (only for `STORAGE_TYPE=sqlite`) |
 
-**Note**: SQLite is only available for local development. Docker production images do not include SQLite support. Use `postgres` or `memory` for Docker deployments.
+**Note**: `sqlite` writes to a local file through the `better-sqlite3` native module, which is stripped from the `latest` (no-AI) Docker image - use it for local development, or pick `postgres`, `turso`, or `memory` for Docker deployments.
+
+**Note**: `turso` reuses the SQLite adapter over the libSQL wire protocol, so it needs no native module and works in every Docker image. It is opt-in: set `STORAGE_TYPE=turso` plus `STORAGE_URL` (and `STORAGE_AUTH_TOKEN` for `libsql://` URLs), exactly like the `postgres` backend.
+
+**Note**: `http://` is for an unauthenticated local `sqld` only. An auth token on an `http://` URL is rejected at startup, because libSQL sends it as given and the token would cross the network in cleartext.
+
+**Note**: only `libsql://` makes the auth token a startup requirement. `https://` and `http://` are also accepted so a self-hosted or local `sqld` can run without one, which means a hosted `https://` Turso URL with a missing or empty `STORAGE_AUTH_TOKEN` starts cleanly and fails on the first query instead. If a `turso` deployment starts and then reports auth errors on every read, check the token before anything else.
 
 ### Application Settings
 
@@ -164,16 +171,39 @@ This means:
 
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
-| `ENCRYPTION_KEY` | No | - | Master key for encrypting stored passwords (min 16 characters) |
+| `ENCRYPTION_KEY` | No | - | Master key for encrypting stored connection passwords **and SSH tunnel secrets** (min 16 characters) |
 | `ENCRYPTION_KEK_SALT` | No | `betterdb-kek-salt-v1` | Salt used for key derivation (customize for additional security) |
 
-**Password Encryption**: When `ENCRYPTION_KEY` is set, all connection passwords are encrypted at rest using envelope encryption (AES-256-GCM). Each password gets a unique encryption key (DEK) that is itself encrypted with a master key (KEK) derived from your `ENCRYPTION_KEY`.
+**Password Encryption**: When `ENCRYPTION_KEY` is set, all connection passwords are encrypted at rest using envelope encryption (AES-256-GCM). Each password gets a unique encryption key (DEK) that is itself encrypted with a master key (KEK) derived from your `ENCRYPTION_KEY`. The same encryption covers SSH tunnel secrets (SSH password, key passphrase, and inline private keys).
 
 - If not set, passwords are stored in plaintext (a warning is logged at startup)
 - Use a strong, random key (e.g., `openssl rand -base64 32`)
 - Store the key securely (e.g., in a secrets manager)
 - If you lose the key, encrypted passwords cannot be recovered
 - Optionally set `ENCRYPTION_KEK_SALT` to a custom value for defense-in-depth (attackers would need both key and salt)
+
+### SSH Tunnels
+
+A connection can reach its database through an SSH bastion/jump host (single hop) instead of connecting directly. Configure it per-connection via the web UI ("Connect via SSH tunnel") or the connection API (`sshTunnel` field). Authentication is a password or a private key.
+
+| Variable | Required | Default | Description |
+|----------|----------|---------|-------------|
+| `BETTERDB_SSH_KEY_DIR` | No | - | Directory that server-side SSH private keys must live in. Enables the "server file path" key source; a connection's `privateKeyPath` must resolve inside this directory. Unset disables file-based keys. |
+
+**Private key sources**:
+
+- **Inline (paste key)** — the PEM key content is submitted with the connection. It is encrypted at rest **only when `ENCRYPTION_KEY` is set**; without it, the key (like connection passwords) is stored in plaintext and a warning is logged at startup. Works in any deployment, including managed/cloud.
+- **Server file path** — the key already exists on the monitor server's filesystem. Set `BETTERDB_SSH_KEY_DIR` to the directory holding allowed keys; the connection's `privateKeyPath` is resolved relative to it and rejected if it escapes the directory (no path traversal). Best for self-hosted deployments that mount keys as a secret volume.
+
+**Host key verification**: pin the SSH server's SHA256 host-key fingerprint on the connection (`hostKeyFingerprint`, e.g. `SHA256:...` from `ssh-keyscan -t ed25519 HOST | ssh-keygen -lf -`). When set, the tunnel is refused unless the server presents a matching key, which prevents a man-in-the-middle on the bastion path. When left unset the server key is accepted and a warning is logged.
+
+The Valkey/Redis client connects to `127.0.0.1:<local-forwarded-port>` through the tunnel. When TLS is enabled, the certificate is still validated against the real database hostname (SNI `servername`), not localhost.
+
+**Host key verification (TOFU):** if you leave `hostKeyFingerprint` unset, the SSH server's key is trusted on first connect and then pinned automatically — subsequent connects are refused if the key changes. Pin the fingerprint up front (see above) to avoid trusting the first key blind.
+
+**Password auth:** password and keyboard-interactive (PAM) bastions are both supported; a password is answered to interactive prompts automatically.
+
+**Known limitation — cluster/Sentinel:** only the configured connection is tunnelled. Cluster/Sentinel monitoring connects to peer nodes at the addresses they advertise, directly rather than through the tunnel, so nodes reachable only via the bastion (e.g. ElastiCache/MemoryDB in a private subnet) will not have per-node views. Use tunnels for single-node/primary monitoring.
 
 ### Audit Trail
 
@@ -198,13 +228,15 @@ This means:
 
 ### Data Retention
 
-Self-hosted BetterDB has **no artificial data retention limits**. Your data retention is determined by:
+| Variable | Required | Default | Description |
+|----------|----------|---------|-------------|
+| `LOCAL_RETENTION_DAYS` | No | - | Self-hosted only: days of monitoring history to keep (daily sweep). Seeds the setting when the settings row is first created; unset = keep forever |
 
-- Your storage backend capacity (PostgreSQL, SQLite, etc.)
-- Any cleanup jobs or policies you configure on your database
-- Available disk space
+Self-hosted BetterDB keeps stored monitoring history **indefinitely by default**, bounded only by your storage backend's capacity and disk space. The retention window, once set, covers every store: slow log and command log entries, client/latency/memory snapshots, latency histograms, anomaly events and correlated groups, **ACL audit entries**, key pattern snapshots and hot keys, webhook deliveries, monitor captures (sessions, chunks, triggers, scheduled), AI cache samples, OTel spans, command/latency stats samples, and vector index snapshots.
 
-**BetterDB Cloud** (launching Q1 2026) will offer managed retention policies by tier.
+To keep the database from growing forever, set a retention window from **Settings → Data Retention** in the UI. On a fresh install the window can also be seeded with `LOCAL_RETENTION_DAYS` — the env var applies only when the settings row is first created; after that the settings page owns the value, so clearing it there sticks even if the env var stays set. A daily sweep then deletes history older than the window, and the high-volume sample stores (command/latency stats samples, vector index snapshots, AI cache samples, OTel spans) are additionally trimmed to the same window on an hourly cycle. Nothing is deleted while the window is unset.
+
+**BetterDB Cloud** applies the tier-based retention policy (Community 7 days, Pro 90, Enterprise 365) automatically; the local retention setting has no effect there.
 
 ### License Configuration
 
@@ -296,7 +328,7 @@ BetterDB Monitor automatically checks for new versions and displays an update ba
 | `KEY_ANALYTICS_SCAN_BATCH_SIZE` | No | `1000` | Batch size for key scanning operations |
 | `KEY_ANALYTICS_INTERVAL_MS` | No | `300000` | Key analytics collection interval (milliseconds) |
 
-Data retention is determined by your license tier: Community keeps 7 days, Pro keeps 30 days, Enterprise keeps data indefinitely.
+Key analytics history follows the standard retention policy (see [Data Retention](#data-retention)): self-hosted installs keep it until a retention window is configured; BetterDB Cloud prunes it at the tier window (Community 7 days, Pro 90, Enterprise 365).
 
 **Note**: Key analytics features require a Pro tier license.
 
@@ -356,6 +388,22 @@ docker run -d \
   -e BETTERDB_LICENSE_KEY=your-license-key \
   -e STORAGE_TYPE=postgres \
   -e STORAGE_URL=postgresql://user:pass@postgres-host:5432/dbname \
+  betterdb/monitor
+```
+
+#### Turso Storage
+
+```bash
+docker run -d \
+  --name betterdb-monitor \
+  -p 3001:3001 \
+  -e DB_HOST=your-valkey-host \
+  -e DB_PORT=6379 \
+  -e DB_PASSWORD=your-password \
+  -e BETTERDB_LICENSE_KEY=your-license-key \
+  -e STORAGE_TYPE=turso \
+  -e STORAGE_URL=libsql://your-db-your-org.turso.io \
+  -e STORAGE_AUTH_TOKEN=your-turso-auth-token \
   betterdb/monitor
 ```
 

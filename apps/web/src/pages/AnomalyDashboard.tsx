@@ -119,6 +119,7 @@ const METRIC_LABELS: Record<string, string> = {
   output_kbps: 'Output KB/s',
   slowlog_last_id: 'Slow Queries',
   acl_denied: 'ACL Denied',
+  auth_failure_burst: 'Auth Failure Burst',
   evicted_keys: 'Evictions',
   blocked_clients: 'Blocked',
   keyspace_misses: 'Cache Misses',
@@ -128,6 +129,7 @@ const METRIC_LABELS: Record<string, string> = {
   command_p99: 'Command P99',
   rejected_connections: 'Rejected Connections',
   client_saturation: 'Client Saturation',
+  client_lockout_risk: 'Admin Lockout Risk',
   evicted_clients: 'Client Evictions',
   raft_health: 'Raft Health',
   replica_slot_state: 'Replica Slot State',
@@ -139,8 +141,17 @@ const METRIC_LABELS: Record<string, string> = {
   load_saturation: 'Load Saturation',
   fork_memory_risk: 'Fork Memory Risk',
   config_drift: 'Config Drift',
+  acl_drift: 'ACL Drift',
+  sentinel_endpoint_drift: 'Sentinel Endpoint Drift',
   hostname_staleness: 'Hostname Staleness',
   large_reply_pressure: 'Large-Reply Pressure',
+  ghost_membership: 'Ghost Membership',
+  lagging_promotion: 'Lagging Promotion',
+  cluster_state: 'Cluster State',
+  cluster_topology: 'Cluster Topology',
+  persistence_child: 'Persistence Child',
+  cpu_utilization: 'CPU Utilization',
+  slowlog_count: 'Slow Queries (legacy)',
 };
 
 function formatTime(ts: number): string {

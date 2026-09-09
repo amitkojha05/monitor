@@ -146,6 +146,46 @@ describe('envSchema', () => {
       });
       expect(result.success).toBe(false);
     });
+
+    it('should require STORAGE_AUTH_TOKEN for a libsql:// STORAGE_URL', () => {
+      const result = envSchema.safeParse({
+        STORAGE_TYPE: 'turso',
+        STORAGE_URL: 'libsql://db.turso.io',
+      });
+      expect(result.success).toBe(false);
+      if (!result.success) {
+        expect(result.error.issues[0].path).toContain('STORAGE_AUTH_TOKEN');
+      }
+    });
+
+    it('should accept an https:// STORAGE_URL with a token', () => {
+      const result = envSchema.safeParse({
+        STORAGE_TYPE: 'turso',
+        STORAGE_URL: 'https://db.turso.io',
+        STORAGE_AUTH_TOKEN: 'token',
+      });
+      expect(result.success).toBe(true);
+    });
+
+    it('should accept an http:// STORAGE_URL with no token', () => {
+      const result = envSchema.safeParse({
+        STORAGE_TYPE: 'turso',
+        STORAGE_URL: 'http://localhost:8080',
+      });
+      expect(result.success).toBe(true);
+    });
+
+    it('should reject a token on an http:// STORAGE_URL', () => {
+      const result = envSchema.safeParse({
+        STORAGE_TYPE: 'turso',
+        STORAGE_URL: 'http://localhost:8080',
+        STORAGE_AUTH_TOKEN: 'token',
+      });
+      expect(result.success).toBe(false);
+      if (!result.success) {
+        expect(result.error.issues[0].message).toContain('cleartext');
+      }
+    });
   });
 
   describe('polling interval validation', () => {
@@ -241,6 +281,20 @@ describe('envSchema', () => {
     it('treats CLOUD_MODE=false as self-hosted (token not required)', () => {
       const result = envSchema.safeParse({ CLOUD_MODE: 'false' });
       expect(result.success).toBe(true);
+    });
+
+    it('requires the token for ANY truthy CLOUD_MODE value, not just "true"', () => {
+      // Regression guard: the boot check and the runtime ingest guard must
+      // share isCloudModeValue semantics — CLOUD_MODE=1 once passed boot
+      // validation and then 401ed every /v1/traces request at runtime.
+      for (const value of ['1', 'yes', 'TRUE']) {
+        const result = envSchema.safeParse({ CLOUD_MODE: value });
+        expect(result.success).toBe(false);
+        if (!result.success) {
+          expect(result.error.issues.some((i) => i.path.includes('OTEL_INGEST_TOKEN'))).toBe(true);
+        }
+      }
+      expect(envSchema.safeParse({ CLOUD_MODE: '0' }).success).toBe(true);
     });
 
     it('defaults OTEL_INGEST_ENABLED to true', () => {

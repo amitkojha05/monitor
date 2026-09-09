@@ -15,6 +15,7 @@ import { PrometheusModule } from './prometheus/prometheus.module';
 import { OtelTelemetryModule } from './otel-telemetry/otel-telemetry.module';
 import { OtelEventsModule } from './otel-telemetry/otel-events.module';
 import { SettingsModule } from './settings/settings.module';
+import { RetentionModule } from './retention/retention.module';
 import { WebhooksModule } from './webhooks/webhooks.module';
 import { TelemetryModule } from './telemetry/telemetry.module';
 import { VectorSearchModule } from './vector-search/vector-search.module';
@@ -28,6 +29,8 @@ import { CliModule } from './cli/cli.module';
 import { PosthogProxyModule } from './posthog-proxy/posthog-proxy.module';
 import { SystemModule } from './system/system.module';
 import { MonitorModule } from './monitor/monitor.module';
+import { isCloudMode } from './common/utils/cloud-mode';
+import { CveModule } from './cve/cve.module';
 
 let AiModule: any = null;
 let LicenseModule: any = null;
@@ -123,7 +126,7 @@ try {
   // Proprietary module not available
 }
 
-if (process.env.CLOUD_MODE) {
+if (isCloudMode()) {
   try {
     const agentModule = require('../../../proprietary/agent/agent.module');
     AgentModule = agentModule.AgentModule;
@@ -143,7 +146,7 @@ if (process.env.CLOUD_MODE) {
 
 // Cloud auth module - uses proprietary implementation in cloud mode
 let CloudAuthModuleToUse: any = CloudAuthModule;
-if (process.env.CLOUD_MODE) {
+if (isCloudMode()) {
   try {
     const proprietaryCloudAuth = require('../../../proprietary/cloud-auth/cloud-auth.module');
     CloudAuthModuleToUse = proprietaryCloudAuth.ProprietaryCloudAuthModule;
@@ -155,10 +158,12 @@ if (process.env.CLOUD_MODE) {
 
 const baseImports = [
   ConfigModule,
-  ThrottlerModule.forRoot([{
-    ttl: 60000, // 60 seconds
-    limit: 10000, // Very high default - endpoint-specific limits provide actual rate limiting
-  }]),
+  ThrottlerModule.forRoot([
+    {
+      ttl: 60000, // 60 seconds
+      limit: 10000, // Very high default - endpoint-specific limits provide actual rate limiting
+    },
+  ]),
   CloudAuthModuleToUse, // Cloud auth (no-op for self-hosted, proprietary for cloud)
   ConnectionsModule, // Must come early - provides ConnectionRegistry globally
   HealthModule,
@@ -173,6 +178,7 @@ const baseImports = [
   OtelTelemetryModule,
   OtelEventsModule,
   SettingsModule,
+  RetentionModule,
   WebhooksModule,
   McpModule,
   VectorSearchModule,
@@ -184,6 +190,7 @@ const baseImports = [
   PosthogProxyModule,
   SystemModule,
   MonitorModule,
+  CveModule,
 ];
 
 const proprietaryImports = [
@@ -210,4 +217,4 @@ const proprietaryImports = [
     },
   ],
 })
-export class AppModule { }
+export class AppModule {}

@@ -1,9 +1,9 @@
-// SQLite adapter for local development only
-// This file is excluded from Docker builds via .dockerignore
-import Database from 'better-sqlite3';
+import type Database from 'better-sqlite3';
+import { chunkedSqliteDelete } from './sqlite-chunked-delete';
 import * as path from 'path';
 import * as fs from 'fs';
 import { randomUUID } from 'crypto';
+import { parseSshTunnel } from '@betterdb/shared';
 import {
   StoragePort,
   StoredAclEntry,
@@ -65,6 +65,8 @@ import type {
   VectorIndexSnapshotQueryOptions,
   MetricForecastSettings,
   MetricKind,
+  StoredCveDataset,
+  CveScanResult,
   StoredCacheProposal,
   StoredCacheProposalAudit,
   CreateCacheProposalInput,
@@ -85,6 +87,8 @@ import {
   StoredCacheProposalAuditSchema,
   variantPayloadSchemaFor,
   MEMORY_PROPOSAL_DEFAULT_EXPIRY_MS,
+  memoryForgetTargetDiscriminator,
+  MemoryForgetPayloadSchema,
   StoredMemoryProposalSchema,
   StoredMemoryProposalAuditSchema,
 } from '@betterdb/shared';
@@ -95,10 +99,138 @@ import type {
   ListMemoryProposalsOptions,
   UpdateMemoryProposalStatusInput,
   AppendMemoryProposalAuditInput,
+  MemoryForgetPayload,
 } from '@betterdb/shared';
 import { SqliteDialect, RowMappers } from './base-sql.adapter';
+import { openLibsqlDatabase } from './libsql-driver';
+import { loadBetterSqlite3 } from './better-sqlite3-driver';
 import { WebhookSqliteRepository } from './repositories/webhook.sqlite.repository';
 import { SlowLogSqliteRepository } from './repositories/slowlog.sqlite.repository';
+
+/**
+ * Idempotent migration for the memory_proposals columns added with the
+ * duplicate-pending guard (#276) and the stale-apply sweep (#277).
+ *
+ * The backfill runs row by row and tolerates a unique violation rather than
+ * failing the migration: a database that already holds duplicate pending rows
+ * for one target — exactly what #276 describes — cannot have all of them keyed,
+ * so the first keeps the discriminator and the rest stay NULL. The index is
+ * partial on `target_discriminator IS NOT NULL`, so those rows simply sit
+ * outside the constraint and age out, while every new insert is guarded.
+ */
+function addMemoryProposalIntegrityColumns(db: Database.Database): void {
+  try {
+    const cols = db.prepare(`PRAGMA table_info(memory_proposals)`).all() as { name: string }[];
+    if (cols.length === 0) {
+      return;
+    }
+
+    // Columns first. The indexes below reference them, and on an existing
+    // database CREATE TABLE IF NOT EXISTS did not create anything — putting the
+    // index DDL in createSchema made initialize() throw `no such column`.
+    if (!cols.some((c) => c.name === 'applying_at')) {
+      db.prepare(`ALTER TABLE memory_proposals ADD COLUMN applying_at INTEGER`).run();
+    }
+
+    // Rows already sitting in `applying` were claimed by a process that no
+    // longer exists — an upgrade restarts it — so they are stuck by definition
+    // and must be sweepable. Without a claim time they would be skipped
+    // forever, which is precisely the state #277 exists to clear. Outside the
+    // ADD COLUMN guard because that statement auto-commits on its own: a crash
+    // between the two would leave the column present and the claim times null,
+    // and a gated backfill would never run again.
+    db.prepare(
+      `UPDATE memory_proposals
+         SET applying_at = COALESCE(reviewed_at, proposed_at)
+         WHERE status = 'applying' AND applying_at IS NULL`,
+    ).run();
+
+    const hadDiscriminator = cols.some((c) => c.name === 'target_discriminator');
+    if (!hadDiscriminator) {
+      db.prepare(`ALTER TABLE memory_proposals ADD COLUMN target_discriminator TEXT`).run();
+    }
+
+    db.prepare(
+      `CREATE INDEX IF NOT EXISTS idx_memory_proposals_applying
+         ON memory_proposals(applying_at)
+         WHERE status = 'applying'`,
+    ).run();
+    // Closes the duplicate-pending race: the guard was list -> compare in JS ->
+    // insert, so two concurrent proposeForget calls for one target both passed
+    // the pre-check. Partial so a target can be proposed again once the
+    // previous one is approved, rejected or expired.
+    db.prepare(
+      `CREATE UNIQUE INDEX IF NOT EXISTS idx_memory_proposals_pending_target
+         ON memory_proposals(connection_id, store_name, target_discriminator)
+         WHERE status = 'pending' AND target_discriminator IS NOT NULL`,
+    ).run();
+
+    // Run unconditionally rather than only on the migrating startup. Each
+    // statement above auto-commits, so a crash partway through the backfill
+    // leaves the column present and the remaining rows NULL: gated on
+    // `hadDiscriminator` they would never be keyed, staying outside the partial
+    // index and unguarded forever. The select below is already the idempotent
+    // form, and matches nothing once the backfill has completed.
+    //
+    // Backfill row by row, tolerating a unique violation rather than failing the
+    // migration: a database that already holds duplicate pending rows for one
+    // target — exactly what #276 describes — cannot have all of them keyed, so
+    // the first keeps the discriminator and the rest stay NULL, outside the
+    // partial index, and age out.
+    const pending = db
+      .prepare(
+        `SELECT id, proposal_payload FROM memory_proposals
+         WHERE status = 'pending' AND target_discriminator IS NULL`,
+      )
+      .all() as { id: string; proposal_payload: string }[];
+    const update = db.prepare(
+      `UPDATE memory_proposals SET target_discriminator = ? WHERE id = ?`,
+    );
+    let skipped = 0;
+    for (const row of pending) {
+      // Parsed, not cast. A malformed legacy payload such as `{}` falls
+      // through to the scope branch and takes the key a genuine empty-scope
+      // target needs, leaving the valid row unkeyed and unguarded.
+      const parsed = MemoryForgetPayloadSchema.safeParse(
+        (() => {
+          try {
+            return JSON.parse(row.proposal_payload);
+          } catch {
+            return null;
+          }
+        })(),
+      );
+      if (!parsed.success) {
+        skipped++;
+        continue;
+      }
+      try {
+        update.run(memoryForgetTargetDiscriminator(parsed.data), row.id);
+      } catch {
+        skipped++;
+      }
+    }
+    if (skipped > 0) {
+      console.warn(
+        `[sqlite] ${skipped} pending memory proposal(s) left unkeyed during backfill — ` +
+          `already duplicates of another pending row, or an unparseable payload.`,
+      );
+    }
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    // "no such table" is the only benign case, and it cannot happen after
+    // createSchema. Anything else means the duplicate-pending index may not
+    // exist, and swallowing that silently ships the race this migration is
+    // here to close.
+    if (/no such table/i.test(message)) {
+      return;
+    }
+    // `cause` keeps the original stack: this throw exists to make a migration
+    // failure visible, and a message without the underlying error makes it
+    // harder to diagnose, not easier.
+    throw new Error(`memory_proposals integrity migration failed: ${message}`, { cause: err });
+  }
+}
 
 /**
  * Idempotent migrations for capture_sessions columns landed across PR 14a + 14b.
@@ -126,9 +258,15 @@ function addCaptureSessionsTargetNodeColumn(db: Database.Database): void {
   }
 }
 
-export interface SqliteAdapterConfig {
-  filepath: string;
-}
+/**
+ * Either a local file or a remote libSQL endpoint, never both. A remote
+ * database is opened by URL and never touches the filesystem, so a config
+ * carrying a filepath alongside a url would read as if the local file still
+ * mattered.
+ */
+export type SqliteAdapterConfig =
+  | { filepath: string; url?: undefined; authToken?: undefined }
+  | { url: string; authToken?: string; filepath?: undefined };
 
 type MetricForecastSettingsRow = {
   connection_id: string;
@@ -206,16 +344,7 @@ export class SqliteAdapter implements StoragePort {
 
   async initialize(): Promise<void> {
     try {
-      // Ensure directory exists
-      const dir = path.dirname(this.config.filepath);
-      if (!fs.existsSync(dir)) {
-        fs.mkdirSync(dir, { recursive: true });
-      }
-
-      // Open database with WAL mode for better concurrency
-      this.db = new Database(this.config.filepath);
-      this.db.pragma('journal_mode = WAL');
-      this.db.pragma('synchronous = NORMAL');
+      this.db = await this.openDatabase();
 
       // Create schema
       this.createSchema();
@@ -230,6 +359,24 @@ export class SqliteAdapter implements StoragePort {
         `Failed to initialize SQLite: ${error instanceof Error ? error.message : 'Unknown error'}`,
       );
     }
+  }
+
+  private async openDatabase(): Promise<Database.Database> {
+    if (this.config.url !== undefined) {
+      return openLibsqlDatabase({ url: this.config.url, authToken: this.config.authToken });
+    }
+
+    // Ensure directory exists
+    const dir = path.dirname(this.config.filepath);
+    if (!fs.existsSync(dir)) {
+      fs.mkdirSync(dir, { recursive: true });
+    }
+
+    // Open database with WAL mode for better concurrency
+    const db = new (await loadBetterSqlite3())(this.config.filepath);
+    db.pragma('journal_mode = WAL');
+    db.pragma('synchronous = NORMAL');
+    return db;
   }
 
   /**
@@ -274,6 +421,7 @@ export class SqliteAdapter implements StoragePort {
       },
       { name: 'inference_sla_config', type: "TEXT NOT NULL DEFAULT '{}'" },
       { name: 'anomaly_detector_config', type: "TEXT NOT NULL DEFAULT '{}'" },
+      { name: 'local_retention_days', type: 'INTEGER' },
     ];
     for (const col of appSettingsMigrations) {
       if (!settingsColumns.has(col.name)) {
@@ -374,6 +522,7 @@ export class SqliteAdapter implements StoragePort {
       DO UPDATE SET
         count = excluded.count,
         age_seconds = excluded.age_seconds,
+        client_info = excluded.client_info,
         timestamp_last_updated = excluded.timestamp_last_updated,
         captured_at = excluded.captured_at
     `);
@@ -539,17 +688,13 @@ export class SqliteAdapter implements StoragePort {
     }
 
     if (connectionId) {
-      const result = this.db
-        .prepare('DELETE FROM acl_audit WHERE captured_at < ? AND connection_id = ?')
-        .run(olderThanTimestamp, connectionId);
-      return result.changes;
+      return chunkedSqliteDelete(this.db, 'acl_audit', 'captured_at < ? AND connection_id = ?', [
+        olderThanTimestamp,
+        connectionId,
+      ]);
     }
 
-    const result = this.db
-      .prepare('DELETE FROM acl_audit WHERE captured_at < ?')
-      .run(olderThanTimestamp);
-
-    return result.changes;
+    return chunkedSqliteDelete(this.db, 'acl_audit', 'captured_at < ?', [olderThanTimestamp]);
   }
 
   async saveClientSnapshot(clients: StoredClientSnapshot[], connectionId: string): Promise<number> {
@@ -1028,23 +1173,41 @@ export class SqliteAdapter implements StoragePort {
     }
 
     if (connectionId) {
-      const result = this.db
-        .prepare('DELETE FROM client_snapshots WHERE captured_at < ? AND connection_id = ?')
-        .run(olderThanTimestamp, connectionId);
-      return result.changes;
+      return chunkedSqliteDelete(this.db, 'client_snapshots', 'captured_at < ? AND connection_id = ?', [
+        olderThanTimestamp,
+        connectionId,
+      ]);
     }
 
-    const result = this.db
-      .prepare('DELETE FROM client_snapshots WHERE captured_at < ?')
-      .run(olderThanTimestamp);
+    return chunkedSqliteDelete(this.db, 'client_snapshots', 'captured_at < ?', [olderThanTimestamp]);
+  }
 
-    return result.changes;
+  private migrateCveAdvisoriesTable(): void {
+    if (!this.db) {
+      return;
+    }
+
+    const columns = this.db.prepare('PRAGMA table_info(cve_advisories)').all() as Array<{
+      name: string;
+    }>;
+    const hasDatasetVersionColumn = columns.some((column) => {
+      return column.name === 'dataset_version';
+    });
+    const hasIdColumn = columns.some((column) => {
+      return column.name === 'id';
+    });
+
+    if (hasDatasetVersionColumn && !hasIdColumn) {
+      this.db.exec('DROP TABLE cve_advisories');
+    }
   }
 
   private createSchema(): void {
     if (!this.db) {
       return;
     }
+
+    this.migrateCveAdvisoriesTable();
 
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS acl_audit (
@@ -1229,6 +1392,8 @@ export class SqliteAdapter implements StoragePort {
 
       CREATE INDEX IF NOT EXISTS idx_hks_connection_captured
         ON hot_key_stats(connection_id, captured_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_hot_key_captured_at_global
+        ON hot_key_stats(captured_at);
 
       CREATE TABLE IF NOT EXISTS app_settings (
         id INTEGER PRIMARY KEY CHECK (id = 1),
@@ -1241,6 +1406,7 @@ export class SqliteAdapter implements StoragePort {
         throughput_forecasting_default_rolling_window_ms INTEGER NOT NULL DEFAULT 21600000,
         throughput_forecasting_default_alert_threshold_ms INTEGER NOT NULL DEFAULT 7200000,
         inference_sla_config TEXT NOT NULL DEFAULT '{}',
+        local_retention_days INTEGER,
         updated_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now') * 1000),
         created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now') * 1000)
       );
@@ -1294,6 +1460,7 @@ export class SqliteAdapter implements StoragePort {
       CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_webhook_id ON webhook_deliveries(webhook_id);
       CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_retry ON webhook_deliveries(next_retry_at) WHERE status = 'retrying';
       CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_connection_id ON webhook_deliveries(connection_id);
+      CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_created_at ON webhook_deliveries(created_at);
 
       CREATE TABLE IF NOT EXISTS slow_log_entries (
         pk INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1401,6 +1568,8 @@ export class SqliteAdapter implements StoragePort {
 
       CREATE INDEX IF NOT EXISTS idx_cmdstat_captured_at
         ON command_stats_samples(connection_id, command, captured_at);
+      CREATE INDEX IF NOT EXISTS idx_cmdstat_captured_at_global
+        ON command_stats_samples(captured_at);
 
       CREATE TABLE IF NOT EXISTS latency_stats_samples (
         id TEXT PRIMARY KEY,
@@ -1417,6 +1586,8 @@ export class SqliteAdapter implements StoragePort {
         ON latency_stats_samples(connection_id, command, captured_at);
       CREATE INDEX IF NOT EXISTS idx_latstat_captured_at
         ON latency_stats_samples(connection_id, captured_at);
+      CREATE INDEX IF NOT EXISTS idx_latstat_captured_at_global
+        ON latency_stats_samples(captured_at);
 
       CREATE TABLE IF NOT EXISTS ai_cache_samples (
         id TEXT PRIMARY KEY,
@@ -1440,6 +1611,8 @@ export class SqliteAdapter implements StoragePort {
         ON ai_cache_samples(connection_id, instance_field, timestamp);
       CREATE INDEX IF NOT EXISTS idx_aicache_ts
         ON ai_cache_samples(connection_id, timestamp);
+      CREATE INDEX IF NOT EXISTS idx_aicache_ts_global
+        ON ai_cache_samples(timestamp);
 
       CREATE TABLE IF NOT EXISTS otel_spans (
         trace_id TEXT NOT NULL,
@@ -1481,6 +1654,27 @@ export class SqliteAdapter implements StoragePort {
 
       CREATE INDEX IF NOT EXISTS idx_vis_timestamp ON vector_index_snapshots(timestamp DESC);
       CREATE INDEX IF NOT EXISTS idx_vis_connection_index ON vector_index_snapshots(connection_id, index_name);
+
+      CREATE TABLE IF NOT EXISTS cve_advisories (
+        id INTEGER PRIMARY KEY DEFAULT 1 CHECK (id = 1),
+        dataset_version TEXT NOT NULL,
+        refreshed_at INTEGER NOT NULL,
+        advisories TEXT NOT NULL,
+        snapshots TEXT NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS cve_scan_results (
+        id TEXT PRIMARY KEY,
+        connection_id TEXT NOT NULL,
+        fingerprint TEXT NOT NULL,
+        dataset_version TEXT NOT NULL,
+        scanned_at INTEGER NOT NULL,
+        last_checked_at INTEGER NOT NULL,
+        result TEXT NOT NULL
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_cve_scan_connection
+        ON cve_scan_results(connection_id, scanned_at DESC);
 
       CREATE TABLE IF NOT EXISTS cache_proposals (
         id TEXT PRIMARY KEY,
@@ -1555,9 +1749,11 @@ export class SqliteAdapter implements StoragePort {
         proposed_at INTEGER NOT NULL,
         reviewed_by TEXT,
         reviewed_at INTEGER,
+        applying_at INTEGER,
         applied_at INTEGER,
         applied_result TEXT,
-        expires_at INTEGER NOT NULL
+        expires_at INTEGER NOT NULL,
+        target_discriminator TEXT
       );
 
       CREATE INDEX IF NOT EXISTS idx_memory_proposals_conn_status_proposed
@@ -1565,6 +1761,7 @@ export class SqliteAdapter implements StoragePort {
       CREATE INDEX IF NOT EXISTS idx_memory_proposals_pending_lookup
         ON memory_proposals(connection_id, store_name)
         WHERE status = 'pending';
+
 
       CREATE TABLE IF NOT EXISTS memory_proposal_audit (
         id TEXT PRIMARY KEY,
@@ -1605,6 +1802,7 @@ export class SqliteAdapter implements StoragePort {
       CREATE INDEX IF NOT EXISTS idx_capture_sessions_started_at ON capture_sessions(started_at DESC);
       CREATE INDEX IF NOT EXISTS idx_capture_sessions_status ON capture_sessions(status, started_at DESC);
       CREATE INDEX IF NOT EXISTS idx_capture_sessions_source ON capture_sessions(source, started_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_capture_sessions_ended_at ON capture_sessions(ended_at);
 
       -- Monitor Capture Chunks Table (one row per batched MONITOR-line chunk; populated by CaptureWriter in a later PR)
       CREATE TABLE IF NOT EXISTS capture_chunks (
@@ -1619,6 +1817,7 @@ export class SqliteAdapter implements StoragePort {
       );
 
       CREATE INDEX IF NOT EXISTS idx_capture_chunks_session ON capture_chunks(session_id, chunk_index);
+      CREATE INDEX IF NOT EXISTS idx_capture_chunks_last_ts ON capture_chunks(last_ts);
 
       -- Pro+ Capture Triggers Table (PR 15)
       CREATE TABLE IF NOT EXISTS capture_triggers (
@@ -1706,6 +1905,7 @@ export class SqliteAdapter implements StoragePort {
     addColumnIfMissing('command_stats_samples', 'rejected_calls', 'INTEGER', '0');
     addColumnIfMissing('command_stats_samples', 'failed_calls', 'INTEGER', '0');
     addCaptureSessionsTargetNodeColumn(this.db!);
+    addMemoryProposalIntegrityColumns(this.db!);
   }
 
   async saveBulkDeleteAudit(record: StoredBulkDeleteAudit): Promise<string> {
@@ -2038,16 +2238,13 @@ export class SqliteAdapter implements StoragePort {
     if (!this.db) throw new Error('Database not initialized');
 
     if (connectionId) {
-      const result = this.db
-        .prepare('DELETE FROM anomaly_events WHERE timestamp < ? AND connection_id = ?')
-        .run(cutoffTimestamp, connectionId);
-      return result.changes;
+      return chunkedSqliteDelete(this.db, 'anomaly_events', 'timestamp < ? AND connection_id = ?', [
+        cutoffTimestamp,
+        connectionId,
+      ]);
     }
 
-    const result = this.db
-      .prepare('DELETE FROM anomaly_events WHERE timestamp < ?')
-      .run(cutoffTimestamp);
-    return result.changes;
+    return chunkedSqliteDelete(this.db, 'anomaly_events', 'timestamp < ?', [cutoffTimestamp]);
   }
 
   async saveCorrelatedGroup(group: StoredCorrelatedGroup, connectionId: string): Promise<string> {
@@ -2131,16 +2328,13 @@ export class SqliteAdapter implements StoragePort {
     if (!this.db) throw new Error('Database not initialized');
 
     if (connectionId) {
-      const result = this.db
-        .prepare('DELETE FROM correlated_anomaly_groups WHERE timestamp < ? AND connection_id = ?')
-        .run(cutoffTimestamp, connectionId);
-      return result.changes;
+      return chunkedSqliteDelete(this.db, 'correlated_anomaly_groups', 'timestamp < ? AND connection_id = ?', [
+        cutoffTimestamp,
+        connectionId,
+      ]);
     }
 
-    const result = this.db
-      .prepare('DELETE FROM correlated_anomaly_groups WHERE timestamp < ?')
-      .run(cutoffTimestamp);
-    return result.changes;
+    return chunkedSqliteDelete(this.db, 'correlated_anomaly_groups', 'timestamp < ?', [cutoffTimestamp]);
   }
 
   async saveKeyPatternSnapshots(
@@ -2404,16 +2598,13 @@ export class SqliteAdapter implements StoragePort {
     if (!this.db) throw new Error('Database not initialized');
 
     if (connectionId) {
-      const result = this.db
-        .prepare('DELETE FROM key_pattern_snapshots WHERE timestamp < ? AND connection_id = ?')
-        .run(cutoffTimestamp, connectionId);
-      return result.changes;
+      return chunkedSqliteDelete(this.db, 'key_pattern_snapshots', 'timestamp < ? AND connection_id = ?', [
+        cutoffTimestamp,
+        connectionId,
+      ]);
     }
 
-    const result = this.db
-      .prepare('DELETE FROM key_pattern_snapshots WHERE timestamp < ?')
-      .run(cutoffTimestamp);
-    return result.changes;
+    return chunkedSqliteDelete(this.db, 'key_pattern_snapshots', 'timestamp < ?', [cutoffTimestamp]);
   }
 
   async saveHotKeys(entries: HotKeyEntry[], connectionId: string): Promise<number> {
@@ -2532,16 +2723,13 @@ export class SqliteAdapter implements StoragePort {
     if (!this.db) throw new Error('Database not initialized');
 
     if (connectionId) {
-      const result = this.db
-        .prepare('DELETE FROM hot_key_stats WHERE captured_at < ? AND connection_id = ?')
-        .run(cutoffTimestamp, connectionId);
-      return result.changes;
+      return chunkedSqliteDelete(this.db, 'hot_key_stats', 'captured_at < ? AND connection_id = ?', [
+        cutoffTimestamp,
+        connectionId,
+      ]);
     }
 
-    const result = this.db
-      .prepare('DELETE FROM hot_key_stats WHERE captured_at < ?')
-      .run(cutoffTimestamp);
-    return result.changes;
+    return chunkedSqliteDelete(this.db, 'hot_key_stats', 'captured_at < ?', [cutoffTimestamp]);
   }
 
   async getSettings(): Promise<AppSettings | null> {
@@ -2566,6 +2754,7 @@ export class SqliteAdapter implements StoragePort {
         anomaly_poll_interval_ms, anomaly_cache_ttl_ms, anomaly_prometheus_interval_ms,
         throughput_forecasting_enabled, throughput_forecasting_default_rolling_window_ms, throughput_forecasting_default_alert_threshold_ms,
         inference_sla_config, anomaly_detector_config,
+        inference_sla_config, local_retention_days,
         updated_at, created_at
       ) VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(id) DO UPDATE SET
@@ -2579,6 +2768,7 @@ export class SqliteAdapter implements StoragePort {
         throughput_forecasting_default_alert_threshold_ms = excluded.throughput_forecasting_default_alert_threshold_ms,
         inference_sla_config = excluded.inference_sla_config,
         anomaly_detector_config = excluded.anomaly_detector_config,
+        local_retention_days = excluded.local_retention_days,
         updated_at = excluded.updated_at
     `);
 
@@ -2593,6 +2783,7 @@ export class SqliteAdapter implements StoragePort {
       settings.metricForecastingDefaultAlertThresholdMs,
       JSON.stringify(settings.inferenceSlaConfig ?? {}),
       JSON.stringify(settings.anomalyDetectorConfig ?? {}),
+      settings.localRetentionDays ?? null,
       now,
       settings.createdAt || now,
     );
@@ -2839,16 +3030,13 @@ export class SqliteAdapter implements StoragePort {
     if (!this.db) throw new Error('Database not initialized');
 
     if (connectionId) {
-      const result = this.db
-        .prepare('DELETE FROM command_log_entries WHERE captured_at < ? AND connection_id = ?')
-        .run(cutoffTimestamp, connectionId);
-      return result.changes;
+      return chunkedSqliteDelete(this.db, 'command_log_entries', 'captured_at < ? AND connection_id = ?', [
+        cutoffTimestamp,
+        connectionId,
+      ]);
     }
 
-    const result = this.db
-      .prepare('DELETE FROM command_log_entries WHERE captured_at < ?')
-      .run(cutoffTimestamp);
-    return result.changes;
+    return chunkedSqliteDelete(this.db, 'command_log_entries', 'captured_at < ?', [cutoffTimestamp]);
   }
 
   // Latency Snapshot Methods
@@ -2931,16 +3119,13 @@ export class SqliteAdapter implements StoragePort {
     if (!this.db) throw new Error('Database not initialized');
 
     if (connectionId) {
-      const result = this.db
-        .prepare('DELETE FROM latency_snapshots WHERE timestamp < ? AND connection_id = ?')
-        .run(cutoffTimestamp, connectionId);
-      return result.changes;
+      return chunkedSqliteDelete(this.db, 'latency_snapshots', 'timestamp < ? AND connection_id = ?', [
+        cutoffTimestamp,
+        connectionId,
+      ]);
     }
 
-    const result = this.db
-      .prepare('DELETE FROM latency_snapshots WHERE timestamp < ?')
-      .run(cutoffTimestamp);
-    return result.changes;
+    return chunkedSqliteDelete(this.db, 'latency_snapshots', 'timestamp < ?', [cutoffTimestamp]);
   }
 
   // Latency Histogram Methods
@@ -3005,16 +3190,13 @@ export class SqliteAdapter implements StoragePort {
     if (!this.db) throw new Error('Database not initialized');
 
     if (connectionId) {
-      const result = this.db
-        .prepare('DELETE FROM latency_histograms WHERE timestamp < ? AND connection_id = ?')
-        .run(cutoffTimestamp, connectionId);
-      return result.changes;
+      return chunkedSqliteDelete(this.db, 'latency_histograms', 'timestamp < ? AND connection_id = ?', [
+        cutoffTimestamp,
+        connectionId,
+      ]);
     }
 
-    const result = this.db
-      .prepare('DELETE FROM latency_histograms WHERE timestamp < ?')
-      .run(cutoffTimestamp);
-    return result.changes;
+    return chunkedSqliteDelete(this.db, 'latency_histograms', 'timestamp < ?', [cutoffTimestamp]);
   }
 
   // Memory Snapshot Methods
@@ -3118,16 +3300,13 @@ export class SqliteAdapter implements StoragePort {
     if (!this.db) throw new Error('Database not initialized');
 
     if (connectionId) {
-      const result = this.db
-        .prepare('DELETE FROM memory_snapshots WHERE timestamp < ? AND connection_id = ?')
-        .run(cutoffTimestamp, connectionId);
-      return result.changes;
+      return chunkedSqliteDelete(this.db, 'memory_snapshots', 'timestamp < ? AND connection_id = ?', [
+        cutoffTimestamp,
+        connectionId,
+      ]);
     }
 
-    const result = this.db
-      .prepare('DELETE FROM memory_snapshots WHERE timestamp < ?')
-      .run(cutoffTimestamp);
-    return result.changes;
+    return chunkedSqliteDelete(this.db, 'memory_snapshots', 'timestamp < ?', [cutoffTimestamp]);
   }
 
   // Command Stats Sample Methods
@@ -3216,16 +3395,13 @@ export class SqliteAdapter implements StoragePort {
     if (!this.db) throw new Error('Database not initialized');
 
     if (connectionId) {
-      const result = this.db
-        .prepare('DELETE FROM command_stats_samples WHERE captured_at < ? AND connection_id = ?')
-        .run(cutoffTimestamp, connectionId);
-      return result.changes;
+      return chunkedSqliteDelete(this.db, 'command_stats_samples', 'captured_at < ? AND connection_id = ?', [
+        cutoffTimestamp,
+        connectionId,
+      ]);
     }
 
-    const result = this.db
-      .prepare('DELETE FROM command_stats_samples WHERE captured_at < ?')
-      .run(cutoffTimestamp);
-    return result.changes;
+    return chunkedSqliteDelete(this.db, 'command_stats_samples', 'captured_at < ?', [cutoffTimestamp]);
   }
 
   // Latency Stats Sample Methods (INFO latencystats)
@@ -3310,16 +3486,13 @@ export class SqliteAdapter implements StoragePort {
     if (!this.db) throw new Error('Database not initialized');
 
     if (connectionId) {
-      const result = this.db
-        .prepare('DELETE FROM latency_stats_samples WHERE captured_at < ? AND connection_id = ?')
-        .run(cutoffTimestamp, connectionId);
-      return result.changes;
+      return chunkedSqliteDelete(this.db, 'latency_stats_samples', 'captured_at < ? AND connection_id = ?', [
+        cutoffTimestamp,
+        connectionId,
+      ]);
     }
 
-    const result = this.db
-      .prepare('DELETE FROM latency_stats_samples WHERE captured_at < ?')
-      .run(cutoffTimestamp);
-    return result.changes;
+    return chunkedSqliteDelete(this.db, 'latency_stats_samples', 'captured_at < ?', [cutoffTimestamp]);
   }
 
   // AI Cache/Memory Sample Methods
@@ -3437,16 +3610,13 @@ export class SqliteAdapter implements StoragePort {
     if (!this.db) throw new Error('Database not initialized');
 
     if (connectionId) {
-      const result = this.db
-        .prepare('DELETE FROM ai_cache_samples WHERE timestamp < ? AND connection_id = ?')
-        .run(cutoffTimestamp, connectionId);
-      return result.changes;
+      return chunkedSqliteDelete(this.db, 'ai_cache_samples', 'timestamp < ? AND connection_id = ?', [
+        cutoffTimestamp,
+        connectionId,
+      ]);
     }
 
-    const result = this.db
-      .prepare('DELETE FROM ai_cache_samples WHERE timestamp < ?')
-      .run(cutoffTimestamp);
-    return result.changes;
+    return chunkedSqliteDelete(this.db, 'ai_cache_samples', 'timestamp < ?', [cutoffTimestamp]);
   }
 
   // OTLP Trace Methods
@@ -3580,14 +3750,30 @@ export class SqliteAdapter implements StoragePort {
     if (!this.db) throw new Error('Database not initialized');
     // Prune whole traces (by trace-level start), not individual spans, so a long
     // trace never loses its root/early spans while later ones survive.
-    const result = this.db
-      .prepare(
-        `DELETE FROM otel_spans WHERE trace_id IN (
-           SELECT trace_id FROM otel_spans GROUP BY trace_id HAVING MIN(start_time_ms) < ?
-         )`,
-      )
-      .run(cutoffTimestamp);
-    return result.changes;
+    // "MIN(start_time_ms) < c" is equivalent to "any span < c", so the
+    // index-driven DISTINCT probe replaces the full GROUP BY aggregate scan.
+    //
+    // Batched per TRACE, not per row: a generic rowid-chunked delete would
+    // re-evaluate the "which traces are old" probe after a chunk removed a
+    // trace's old spans, letting its newer spans survive as orphans. One
+    // statement per batch selects up to TRACE_BATCH old trace ids and deletes
+    // ALL their spans atomically, so no trace is ever split; terminate on an
+    // empty batch (row counts count spans, not traces, so a short batch
+    // proves nothing).
+    const TRACE_BATCH = 1_000;
+    const deleteBatch = this.db.prepare(
+      `DELETE FROM otel_spans WHERE trace_id IN (
+         SELECT DISTINCT trace_id FROM otel_spans WHERE start_time_ms < ? LIMIT ?
+       )`,
+    );
+    let total = 0;
+    for (;;) {
+      const { changes } = deleteBatch.run(cutoffTimestamp, TRACE_BATCH);
+      if (changes === 0) break;
+      total += changes;
+      await new Promise<void>((resolve) => setImmediate(resolve));
+    }
+    return total;
   }
 
   // Vector Index Snapshot Methods
@@ -3700,16 +3886,109 @@ export class SqliteAdapter implements StoragePort {
     if (!this.db) throw new Error('Database not initialized');
 
     if (connectionId) {
-      const result = this.db
-        .prepare('DELETE FROM vector_index_snapshots WHERE timestamp < ? AND connection_id = ?')
-        .run(cutoffTimestamp, connectionId);
-      return result.changes;
+      return chunkedSqliteDelete(this.db, 'vector_index_snapshots', 'timestamp < ? AND connection_id = ?', [
+        cutoffTimestamp,
+        connectionId,
+      ]);
     }
 
-    const result = this.db
-      .prepare('DELETE FROM vector_index_snapshots WHERE timestamp < ?')
-      .run(cutoffTimestamp);
-    return result.changes;
+    return chunkedSqliteDelete(this.db, 'vector_index_snapshots', 'timestamp < ?', [cutoffTimestamp]);
+  }
+
+  // CVE Inspection Methods
+  async saveCveDataset(dataset: StoredCveDataset): Promise<void> {
+    if (!this.db) throw new Error('Database not initialized');
+
+    this.db
+      .prepare(
+        `INSERT INTO cve_advisories (id, dataset_version, refreshed_at, advisories, snapshots)
+         VALUES (1, ?, ?, ?, ?)
+         ON CONFLICT (id) DO UPDATE SET
+           dataset_version = excluded.dataset_version,
+           refreshed_at = excluded.refreshed_at,
+           advisories = excluded.advisories,
+           snapshots = excluded.snapshots`,
+      )
+      .run(
+        dataset.datasetVersion,
+        dataset.refreshedAt,
+        JSON.stringify(dataset.advisories),
+        JSON.stringify(dataset.snapshots),
+      );
+  }
+
+  async getCveDataset(): Promise<StoredCveDataset | null> {
+    if (!this.db) throw new Error('Database not initialized');
+
+    const row = this.db
+      .prepare(
+        `SELECT dataset_version, refreshed_at, advisories, snapshots
+         FROM cve_advisories
+         WHERE id = 1`,
+      )
+      .get() as
+      | { dataset_version: string; refreshed_at: number; advisories: string; snapshots: string }
+      | undefined;
+
+    if (!row) {
+      return null;
+    }
+
+    return {
+      datasetVersion: row.dataset_version,
+      refreshedAt: row.refreshed_at,
+      advisories: JSON.parse(row.advisories) as StoredCveDataset['advisories'],
+      snapshots: JSON.parse(row.snapshots) as StoredCveDataset['snapshots'],
+    };
+  }
+
+  async saveCveScanResult(result: CveScanResult): Promise<void> {
+    if (!this.db) throw new Error('Database not initialized');
+
+    this.db
+      .prepare(
+        `INSERT INTO cve_scan_results
+           (id, connection_id, fingerprint, dataset_version, scanned_at, last_checked_at, result)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        randomUUID(),
+        result.connectionId,
+        result.fingerprint,
+        result.datasetVersion,
+        result.scannedAt,
+        result.lastCheckedAt,
+        JSON.stringify(result),
+      );
+
+    this.db
+      .prepare(
+        `DELETE FROM cve_scan_results
+         WHERE connection_id = ?
+           AND id NOT IN (
+             SELECT id FROM cve_scan_results WHERE connection_id = ?
+             ORDER BY scanned_at DESC, rowid DESC LIMIT 1
+           )`,
+      )
+      .run(result.connectionId, result.connectionId);
+  }
+
+  async getCveScanResult(connectionId: string): Promise<CveScanResult | null> {
+    if (!this.db) throw new Error('Database not initialized');
+
+    const row = this.db
+      .prepare(
+        `SELECT result FROM cve_scan_results
+         WHERE connection_id = ?
+         ORDER BY scanned_at DESC, rowid DESC LIMIT 1`,
+      )
+      .get(connectionId) as { result: string } | undefined;
+
+    if (!row) {
+      return null;
+    }
+
+    return JSON.parse(row.result) as CveScanResult;
   }
 
   // Connection Management Methods
@@ -3728,6 +4007,7 @@ export class SqliteAdapter implements StoragePort {
         password_encrypted INTEGER DEFAULT 0,
         db_index INTEGER DEFAULT 0,
         tls INTEGER DEFAULT 0,
+        ssh_tunnel TEXT,
         is_default INTEGER DEFAULT 0,
         created_at INTEGER NOT NULL,
         updated_at INTEGER
@@ -3738,6 +4018,10 @@ export class SqliteAdapter implements StoragePort {
     const columns = this.db.prepare('PRAGMA table_info(connections)').all() as { name: string }[];
     if (!columns.some((c) => c.name === 'password_encrypted')) {
       this.db.exec('ALTER TABLE connections ADD COLUMN password_encrypted INTEGER DEFAULT 0');
+    }
+    // Migration: add ssh_tunnel column if it doesn't exist
+    if (!columns.some((c) => c.name === 'ssh_tunnel')) {
+      this.db.exec('ALTER TABLE connections ADD COLUMN ssh_tunnel TEXT');
     }
 
     // Agent Tokens Table (cloud-only, but created in all environments for interface compliance)
@@ -3761,8 +4045,8 @@ export class SqliteAdapter implements StoragePort {
     }
 
     const stmt = this.db.prepare(`
-      INSERT INTO connections (id, name, host, port, username, password, password_encrypted, db_index, tls, is_default, created_at, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO connections (id, name, host, port, username, password, password_encrypted, db_index, tls, ssh_tunnel, is_default, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(id) DO UPDATE SET
         name = excluded.name,
         host = excluded.host,
@@ -3772,6 +4056,7 @@ export class SqliteAdapter implements StoragePort {
         password_encrypted = excluded.password_encrypted,
         db_index = excluded.db_index,
         tls = excluded.tls,
+        ssh_tunnel = excluded.ssh_tunnel,
         is_default = excluded.is_default,
         updated_at = excluded.updated_at
     `);
@@ -3786,6 +4071,7 @@ export class SqliteAdapter implements StoragePort {
       config.passwordEncrypted ? 1 : 0,
       config.dbIndex || 0,
       config.tls ? 1 : 0,
+      config.sshTunnel ? JSON.stringify(config.sshTunnel) : null,
       config.isDefault ? 1 : 0,
       config.createdAt,
       config.updatedAt || null,
@@ -3815,6 +4101,7 @@ export class SqliteAdapter implements StoragePort {
       passwordEncrypted: row.password_encrypted === 1,
       dbIndex: row.db_index,
       tls: row.tls === 1,
+      sshTunnel: parseSshTunnel(row.ssh_tunnel),
       isDefault: row.is_default === 1,
       createdAt: row.created_at,
       updatedAt: row.updated_at || undefined,
@@ -3842,6 +4129,7 @@ export class SqliteAdapter implements StoragePort {
       passwordEncrypted: row.password_encrypted === 1,
       dbIndex: row.db_index,
       tls: row.tls === 1,
+      sshTunnel: parseSshTunnel(row.ssh_tunnel),
       isDefault: row.is_default === 1,
       createdAt: row.created_at,
       updatedAt: row.updated_at || undefined,
@@ -4300,8 +4588,9 @@ export class SqliteAdapter implements StoragePort {
       .prepare(
         `INSERT INTO memory_proposals (
           id, connection_id, store_name, proposal_type,
-          proposal_payload, reasoning, status, proposed_by, proposed_at, expires_at
-        ) VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)`,
+          proposal_payload, reasoning, status, proposed_by, proposed_at, expires_at,
+          target_discriminator
+        ) VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?)`,
       )
       .run(
         input.id,
@@ -4313,6 +4602,7 @@ export class SqliteAdapter implements StoragePort {
         input.proposed_by ?? null,
         proposedAt,
         expiresAt,
+        memoryForgetTargetDiscriminator(input.proposal_payload),
       );
     const row = this.db
       .prepare('SELECT * FROM memory_proposals WHERE id = ?')
@@ -4396,6 +4686,10 @@ export class SqliteAdapter implements StoragePort {
       sets.push('applied_at = ?');
       params.push(input.applied_at);
     }
+    if (input.applying_at !== undefined) {
+      sets.push('applying_at = ?');
+      params.push(input.applying_at);
+    }
     if (input.applied_result !== undefined) {
       sets.push('applied_result = ?');
       params.push(input.applied_result === null ? null : JSON.stringify(input.applied_result));
@@ -4477,6 +4771,49 @@ export class SqliteAdapter implements StoragePort {
       )
       .all(now) as MemoryProposalRow[];
     return rows.map((row) => this.mapMemoryProposalRow(row));
+  }
+
+  async failStaleApplyingMemoryProposalsBefore(cutoff: number): Promise<StoredMemoryProposal[]> {
+    if (!this.db) throw new Error('Database not initialized');
+    // `failed` rather than a new status: it already exists everywhere, and it
+    // is honest — the apply did not complete. The result says explicitly that
+    // partial deletion is unknown, because a crash mid-dispatch may have
+    // removed memories already and claiming a clean rollback would be a lie.
+    const rows = this.db
+      .prepare(
+        `UPDATE memory_proposals
+         SET status = 'failed', applied_at = ?, applied_result = ?
+         WHERE status = 'applying' AND applying_at IS NOT NULL AND applying_at <= ?
+         RETURNING *`,
+      )
+      .all(
+        Date.now(),
+        JSON.stringify({
+          success: false,
+          error: 'apply presumed dead',
+          details: { reason: 'stale_apply', partial: 'unknown' },
+        }),
+        cutoff,
+      ) as MemoryProposalRow[];
+    return rows.map((row) => this.mapMemoryProposalRow(row));
+  }
+
+  async countPendingMemoryProposalsByTarget(input: {
+    connection_id: string;
+    store_name: string;
+    target_discriminator: string;
+  }): Promise<number> {
+    if (!this.db) throw new Error('Database not initialized');
+    const row = this.db
+      .prepare(
+        `SELECT COUNT(*) AS count FROM memory_proposals
+         WHERE connection_id = ? AND store_name = ? AND target_discriminator = ?
+           AND status = 'pending'`,
+      )
+      .get(input.connection_id, input.store_name, input.target_discriminator) as {
+      count: number;
+    };
+    return row.count;
   }
 
   async saveCaptureSession(
@@ -4887,42 +5224,37 @@ export class SqliteAdapter implements StoragePort {
 
   async pruneOldCaptureSessions(cutoffTimestamp: number): Promise<number> {
     if (!this.db) throw new Error('Database not initialized');
-    const result = this.db
-      .prepare(
-        "DELETE FROM capture_sessions WHERE ended_at IS NOT NULL AND ended_at < ? AND status != 'running'",
-      )
-      .run(cutoffTimestamp);
-    return result.changes;
+    return chunkedSqliteDelete(
+      this.db,
+      'capture_sessions',
+      "ended_at IS NOT NULL AND ended_at < ? AND status != 'running'",
+      [cutoffTimestamp],
+    );
   }
 
   async pruneOldCaptureChunks(cutoffTimestamp: number): Promise<number> {
     if (!this.db) throw new Error('Database not initialized');
-    const result = this.db
-      .prepare('DELETE FROM capture_chunks WHERE last_ts < ?')
-      .run(cutoffTimestamp);
-    return result.changes;
+    return chunkedSqliteDelete(this.db, 'capture_chunks', 'last_ts < ?', [cutoffTimestamp]);
   }
 
   async pruneOldCaptureTriggers(cutoffTimestamp: number): Promise<number> {
     if (!this.db) throw new Error('Database not initialized');
-    const result = this.db
-      .prepare(
-        `DELETE FROM capture_triggers
-         WHERE created_at < ?
-           AND status IN ('fired','skipped','expired','cancelled')`,
-      )
-      .run(cutoffTimestamp);
-    return result.changes;
+    return chunkedSqliteDelete(
+      this.db,
+      'capture_triggers',
+      "created_at < ? AND status IN ('fired','skipped','expired','cancelled')",
+      [cutoffTimestamp],
+    );
   }
 
   async pruneOldScheduledCaptures(cutoffTimestamp: number): Promise<number> {
     if (!this.db) throw new Error('Database not initialized');
-    const result = this.db
-      .prepare(
-        "DELETE FROM scheduled_captures WHERE created_at < ? AND status = 'disabled'",
-      )
-      .run(cutoffTimestamp);
-    return result.changes;
+    return chunkedSqliteDelete(
+      this.db,
+      'scheduled_captures',
+      "created_at < ? AND status = 'disabled'",
+      [cutoffTimestamp],
+    );
   }
 
   private mapScheduledCaptureRow(row: Record<string, unknown>): StoredScheduledCapture {

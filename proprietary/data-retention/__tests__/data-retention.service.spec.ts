@@ -2,6 +2,8 @@ import { Test, TestingModule } from '@nestjs/testing';
 import { DataRetentionService } from '../data-retention.service';
 import { LicenseService } from '@proprietary/licenses/license.service';
 import { Tier } from '@proprietary/licenses/types';
+import { TIER_RETENTION_DAYS } from '@betterdb/shared';
+import { RetentionPolicyService } from '@app/retention/retention-policy.service';
 import { StoragePort } from '@app/common/interfaces/storage-port.interface';
 
 const MS_PER_DAY = 24 * 60 * 60 * 1000;
@@ -24,6 +26,7 @@ describe('DataRetentionService', () => {
       pruneOldAnomalyEvents: jest.fn().mockResolvedValue(4),
       pruneOldCorrelatedGroups: jest.fn().mockResolvedValue(5),
       pruneOldKeyPatternSnapshots: jest.fn().mockResolvedValue(6),
+      pruneOldHotKeys: jest.fn().mockResolvedValue(21),
       pruneOldEntries: jest.fn().mockResolvedValue(7),
       pruneOldDeliveries: jest.fn().mockResolvedValue(8),
       pruneOldLatencySnapshots: jest.fn().mockResolvedValue(9),
@@ -35,6 +38,10 @@ describe('DataRetentionService', () => {
       pruneOldScheduledCaptures: jest.fn().mockResolvedValue(15),
       pruneOldAiCacheSamples: jest.fn().mockResolvedValue(16),
       pruneOldOtelSpans: jest.fn().mockResolvedValue(16),
+      pruneOldOtelSpans: jest.fn().mockResolvedValue(17),
+      pruneOldCommandStatsSamples: jest.fn().mockResolvedValue(18),
+      pruneOldLatencyStatsSamples: jest.fn().mockResolvedValue(19),
+      pruneOldVectorIndexSnapshots: jest.fn().mockResolvedValue(20),
     } as any;
 
     licenseService = {
@@ -46,6 +53,13 @@ describe('DataRetentionService', () => {
         DataRetentionService,
         { provide: 'STORAGE_CLIENT', useValue: storage },
         { provide: LicenseService, useValue: licenseService },
+        {
+          provide: RetentionPolicyService,
+          useValue: {
+            getRetentionDays: jest.fn(() => TIER_RETENTION_DAYS[licenseService.getLicenseTier()]),
+            getSampleRetentionMs: jest.fn(() => 7 * MS_PER_DAY),
+          },
+        },
       ],
     }).compile();
 
@@ -70,6 +84,7 @@ describe('DataRetentionService', () => {
     'pruneOldAnomalyEvents',
     'pruneOldCorrelatedGroups',
     'pruneOldKeyPatternSnapshots',
+    'pruneOldHotKeys',
     'pruneOldEntries',
     'pruneOldDeliveries',
     'pruneOldLatencySnapshots',
@@ -80,6 +95,15 @@ describe('DataRetentionService', () => {
     'pruneOldCaptureTriggers',
     'pruneOldScheduledCaptures',
     'pruneOldAiCacheSamples',
+    'pruneOldOtelSpans',
+  ] as const;
+
+  // The high-volume sample stores are swept at the tighter cloud sample cap,
+  // not the tier window.
+  const samplePruneMethods = [
+    'pruneOldCommandStatsSamples',
+    'pruneOldLatencyStatsSamples',
+    'pruneOldVectorIndexSnapshots',
   ] as const;
 
   it('community tier uses 7-day cutoff and calls all prune methods', async () => {
@@ -92,9 +116,13 @@ describe('DataRetentionService', () => {
       expect(storage[method]).toHaveBeenCalledTimes(1);
       expect(storage[method]).toHaveBeenCalledWith(expectedCutoff);
     }
+    for (const method of samplePruneMethods) {
+      expect(storage[method]).toHaveBeenCalledTimes(1);
+      expect(storage[method]).toHaveBeenCalledWith(NOW - 7 * MS_PER_DAY);
+    }
   });
 
-  it('pro tier uses 90-day cutoff', async () => {
+  it('pro tier uses 90-day cutoff, sample stores stay at the 7-day cap', async () => {
     licenseService.getLicenseTier.mockReturnValue(Tier.pro);
     const expectedCutoff = NOW - 90 * MS_PER_DAY;
 
@@ -103,9 +131,12 @@ describe('DataRetentionService', () => {
     for (const method of allPruneMethods) {
       expect(storage[method]).toHaveBeenCalledWith(expectedCutoff);
     }
+    for (const method of samplePruneMethods) {
+      expect(storage[method]).toHaveBeenCalledWith(NOW - 7 * MS_PER_DAY);
+    }
   });
 
-  it('enterprise tier uses 365-day cutoff', async () => {
+  it('enterprise tier uses 365-day cutoff, sample stores stay at the 7-day cap', async () => {
     licenseService.getLicenseTier.mockReturnValue(Tier.enterprise);
     const expectedCutoff = NOW - 365 * MS_PER_DAY;
 
@@ -113,6 +144,9 @@ describe('DataRetentionService', () => {
 
     for (const method of allPruneMethods) {
       expect(storage[method]).toHaveBeenCalledWith(expectedCutoff);
+    }
+    for (const method of samplePruneMethods) {
+      expect(storage[method]).toHaveBeenCalledWith(NOW - 7 * MS_PER_DAY);
     }
   });
 

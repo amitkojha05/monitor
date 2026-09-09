@@ -9,6 +9,8 @@ import { CommandLogAnalyticsService } from '@app/commandlog-analytics/commandlog
 import { ConnectionRegistry } from '@app/connections/connection-registry.service';
 import { ConnectionContext } from '@app/common/services/multi-connection-poller';
 import { DatabasePort } from '@app/common/interfaces/database-port.interface';
+import { ClusterNode, SentinelNodeInfo } from '@app/common/types/metrics.types';
+import { nodeAclDigest } from '../acl-drift-detector';
 import {
   MetricType,
   METRICS_HANDLED_OUTSIDE_EXTRACTOR,
@@ -44,6 +46,7 @@ describe('AnomalyService', () => {
       getAnomalyEvents: jest.fn().mockResolvedValue([]),
       getCorrelatedGroups: jest.fn().mockResolvedValue([]),
       resolveAnomaly: jest.fn().mockResolvedValue(true),
+      getAclEntries: jest.fn().mockResolvedValue([]),
       initialize: jest.fn().mockResolvedValue(undefined),
       close: jest.fn().mockResolvedValue(undefined),
       isReady: jest.fn().mockReturnValue(true),
@@ -93,6 +96,7 @@ describe('AnomalyService', () => {
           acl_access_denied_auth: '0',
         },
       }),
+      getAclList: jest.fn().mockResolvedValue([]),
     };
 
     mockCtx = {
@@ -4645,6 +4649,1125 @@ describe('AnomalyService', () => {
       (service as any).onConnectionRemoved('conn-1');
       expect((service as any).controlPlaneState.has('conn-1')).toBe(false);
       expect((service as any).cpSatLastConnectedSlaves.has('conn-1')).toBe(false);
+    });
+  });
+
+  // ─── ghost membership: endpoint-identity faults (valkey#1757, valkey#2768) ──
+
+  describe('ghost membership — endpoint identity', () => {
+    const clusterInfoResponse = {
+      server: { role: 'master' },
+      clients: { connected_clients: '10', blocked_clients: '0' },
+      memory: { used_memory: '1000000', allocator_frag_ratio: '1.1' },
+      stats: {
+        instantaneous_ops_per_sec: '100',
+        instantaneous_input_kbps: '50',
+        instantaneous_output_kbps: '30',
+        evicted_keys: '0',
+        keyspace_misses: '5',
+        rejected_connections: '0',
+        acl_access_denied_auth: '0',
+        cluster_enabled: '1',
+      },
+    };
+
+    function gnode(id: string, address: string, flags: string[], master = ''): ClusterNode {
+      return {
+        id,
+        address,
+        flags,
+        master,
+        pingSent: 0,
+        pongReceived: 0,
+        configEpoch: 1,
+        linkState: 'connected',
+        slots: [],
+      };
+    }
+
+    let now: number;
+
+    beforeEach(() => {
+      (dbClient.getInfoParsed as jest.Mock).mockResolvedValue(clusterInfoResponse);
+      dbClient.getClusterInfo = jest.fn().mockResolvedValue({ cluster_state: 'ok' });
+      now = 1_700_000_000_000;
+      jest.spyOn(Date, 'now').mockImplementation(() => now);
+    });
+
+    afterEach(() => {
+      (Date.now as jest.Mock).mockRestore();
+    });
+
+    const ghostEvents = () => {
+      return service.getRecentEvents().filter((e) => {
+        return e.metricType === MetricType.GHOST_MEMBERSHIP;
+      });
+    };
+
+    /** Poll twice across the 30s grace window so a persistent finding alerts. */
+    async function pollPastGate(): Promise<void> {
+      await poll();
+      now += 31_000;
+      await poll();
+    }
+
+    it('emits CRITICAL for a node whose address flipped to loopback among routable peers', async () => {
+      dbClient.getClusterNodes = jest
+        .fn()
+        .mockResolvedValue([
+          gnode('flippedAAAA', '127.0.0.1:6379@16379', ['master']),
+          gnode('routableBBB', '10.0.0.2:6379@16379', ['myself', 'master']),
+          gnode('routableCCC', '10.0.0.3:6379@16379', ['master']),
+        ]);
+
+      await pollPastGate();
+
+      const events = ghostEvents();
+      expect(events).toHaveLength(1);
+      expect(events[0].severity).toBe(AnomalySeverity.CRITICAL);
+      expect(events[0].message).toContain('2768');
+      expect(events[0].message).toContain('cluster-announce-ip');
+      expect(events[0].message).toContain('flipped');
+    });
+
+    it('emits WARNING for two live ids colliding on one routable endpoint', async () => {
+      dbClient.getClusterNodes = jest
+        .fn()
+        .mockResolvedValue([
+          gnode('liveAAAAAAA', '10.0.0.1:6379@16379', ['master']),
+          gnode('liveBBBBBBB', '10.0.0.1:6379@16379', ['master']),
+          gnode('otherCCCCCC', '10.0.0.2:6379@16379', ['myself', 'master']),
+        ]);
+
+      await pollPastGate();
+
+      const events = ghostEvents();
+      expect(events).toHaveLength(1);
+      expect(events[0].severity).toBe(AnomalySeverity.WARNING);
+      expect(events[0].message).toContain('claimed by 2 live cluster nodes');
+      expect(events[0].message).toContain('Do NOT run CLUSTER FORGET');
+    });
+
+    it('escalates a collision to CRITICAL when a node is replicating from itself', async () => {
+      dbClient.getClusterNodes = jest
+        .fn()
+        .mockResolvedValue([
+          gnode('liveAAAAAAA', '10.0.0.1:6379@16379', ['master']),
+          gnode('liveBBBBBBB', '10.0.0.1:6379@16379', ['slave'], 'liveBBBBBBB'),
+          gnode('otherCCCCCC', '10.0.0.2:6379@16379', ['myself', 'master']),
+        ]);
+
+      await pollPastGate();
+
+      const events = ghostEvents();
+      expect(events).toHaveLength(1);
+      expect(events[0].severity).toBe(AnomalySeverity.CRITICAL);
+      expect(events[0].message).toContain('replica of');
+    });
+
+    it('escalates an already-alerted WARNING collision to CRITICAL when self-replication appears later', async () => {
+      const collision = (masterOfB: string) => {
+        return [
+          gnode('liveAAAAAAA', '10.0.0.1:6379@16379', ['master']),
+          gnode('liveBBBBBBB', '10.0.0.1:6379@16379', ['slave'], masterOfB),
+          gnode('otherCCCCCC', '10.0.0.2:6379@16379', ['myself', 'master']),
+        ];
+      };
+
+      dbClient.getClusterNodes = jest.fn().mockResolvedValue(collision('liveAAAAAAA'));
+      await pollPastGate();
+
+      const warned = ghostEvents();
+      expect(warned).toHaveLength(1);
+      expect(warned[0].severity).toBe(AnomalySeverity.WARNING);
+
+      // The escalation carries a new signature, so it re-enters the persistence
+      // gate and alerts on the poll after the grace window rather than instantly.
+      dbClient.getClusterNodes = jest.fn().mockResolvedValue(collision('liveBBBBBBB'));
+      now += 31_000;
+      await poll();
+      expect(ghostEvents()).toHaveLength(1);
+
+      now += 31_000;
+      await poll();
+
+      const events = ghostEvents();
+      expect(events).toHaveLength(2);
+      const escalation = events.find((e) => {
+        return e.severity === AnomalySeverity.CRITICAL;
+      });
+      expect(escalation).toBeDefined();
+      expect(escalation?.message).toContain('replica of');
+    });
+
+    it('still emits the unchanged stale-twin WARNING with FORGET advice', async () => {
+      dbClient.getClusterNodes = jest
+        .fn()
+        .mockResolvedValue([
+          gnode('oldGhostIdd', '10.0.0.1:6379@16379', ['master', 'fail']),
+          gnode('newLiveIddd', '10.0.0.1:6379@16379', ['master']),
+          gnode('otherCCCCCC', '10.0.0.2:6379@16379', ['myself', 'master']),
+        ]);
+
+      await pollPastGate();
+
+      const events = ghostEvents();
+      expect(events).toHaveLength(1);
+      expect(events[0].severity).toBe(AnomalySeverity.WARNING);
+      expect(events[0].message).toContain('CLUSTER FORGET oldGhostIdd');
+      expect(events[0].message).toContain('1757');
+    });
+
+    it('suppresses a single-poll transient inside the grace window', async () => {
+      dbClient.getClusterNodes = jest
+        .fn()
+        .mockResolvedValue([
+          gnode('flippedAAAA', '127.0.0.1:6379@16379', ['master']),
+          gnode('routableBBB', '10.0.0.2:6379@16379', ['myself', 'master']),
+        ]);
+      await poll();
+      expect(ghostEvents()).toHaveLength(0);
+
+      dbClient.getClusterNodes = jest
+        .fn()
+        .mockResolvedValue([
+          gnode('flippedAAAA', '10.0.0.1:6379@16379', ['master']),
+          gnode('routableBBB', '10.0.0.2:6379@16379', ['myself', 'master']),
+        ]);
+      now += 31_000;
+      await poll();
+
+      expect(ghostEvents()).toHaveLength(0);
+    });
+
+    it('stays silent on an all-loopback local cluster', async () => {
+      dbClient.getClusterNodes = jest
+        .fn()
+        .mockResolvedValue([
+          gnode('localAAAAAA', '127.0.0.1:7000@17000', ['myself', 'master']),
+          gnode('localBBBBBB', '127.0.0.1:7001@17001', ['master']),
+          gnode('localCCCCCC', '127.0.0.1:7002@17002', ['slave'], 'localBBBBBB'),
+        ]);
+
+      await pollPastGate();
+
+      expect(ghostEvents()).toHaveLength(0);
+    });
+
+    it('clears ghost state on connection removal', async () => {
+      dbClient.getClusterNodes = jest
+        .fn()
+        .mockResolvedValue([
+          gnode('flippedAAAA', '127.0.0.1:6379@16379', ['master']),
+          gnode('routableBBB', '10.0.0.2:6379@16379', ['myself', 'master']),
+        ]);
+      await pollPastGate();
+      expect((service as any).ghostMemberFirstSeen.has('conn-1')).toBe(true);
+
+      (service as any).onConnectionRemoved('conn-1');
+
+      expect((service as any).ghostMemberFirstSeen.has('conn-1')).toBe(false);
+      expect((service as any).activeGhostMembers.has('conn-1')).toBe(false);
+    });
+  });
+
+  // ─── ghost membership Layer 2: forget-rejoin (valkey#2788) ─────────────────
+
+  describe('ghost membership — forget rejoin', () => {
+    const clusterInfoResponse = {
+      server: { role: 'master' },
+      clients: { connected_clients: '10', blocked_clients: '0' },
+      memory: { used_memory: '1000000', allocator_frag_ratio: '1.1' },
+      stats: {
+        instantaneous_ops_per_sec: '100',
+        instantaneous_input_kbps: '50',
+        instantaneous_output_kbps: '30',
+        evicted_keys: '0',
+        keyspace_misses: '5',
+        rejected_connections: '0',
+        acl_access_denied_auth: '0',
+        cluster_enabled: '1',
+      },
+    };
+
+    function rnode(id: string, address: string, flags: string[]): ClusterNode {
+      return {
+        id,
+        address,
+        flags,
+        master: '',
+        pingSent: 0,
+        pongReceived: 0,
+        configEpoch: 1,
+        linkState: 'connected',
+        slots: [],
+      };
+    }
+
+    const nodeA = rnode('primaryAAAA', '10.0.0.1:6379@16379', ['myself', 'master']);
+    const nodeB = rnode('primaryBBBB', '10.0.0.2:6379@16379', ['master']);
+    const nodeC = rnode('removedCCCC', '10.0.0.3:6379@16379', ['master']);
+
+    let now: number;
+
+    beforeEach(() => {
+      (dbClient.getInfoParsed as jest.Mock).mockResolvedValue(clusterInfoResponse);
+      dbClient.getClusterInfo = jest.fn().mockResolvedValue({ cluster_state: 'ok' });
+      dbClient.getClusterNodes = jest.fn().mockResolvedValue([nodeA, nodeB, nodeC]);
+      now = 1_700_000_000_000;
+      jest.spyOn(Date, 'now').mockImplementation(() => now);
+    });
+
+    afterEach(() => {
+      (Date.now as jest.Mock).mockRestore();
+    });
+
+    const rejoinEvents = () => {
+      return service.getRecentEvents().filter((e) => {
+        return (
+          e.metricType === MetricType.GHOST_MEMBERSHIP && e.message.includes('reintroduced itself')
+        );
+      });
+    };
+
+    // Steps of 31s so a two-poll absence also clears the 60s FORGET blacklist
+    // window the detector gates on.
+    async function pollWith(nodes: ClusterNode[], stepMs = 31_000): Promise<void> {
+      now += stepMs;
+      (dbClient.getClusterNodes as jest.Mock).mockResolvedValue(nodes);
+      await poll();
+    }
+
+    it('emits a WARNING when a forgotten node reintroduces itself', async () => {
+      await pollWith([nodeA, nodeB, nodeC]);
+      await pollWith([nodeA, nodeB]);
+      await pollWith([nodeA, nodeB]);
+      await pollWith([nodeA, nodeB, nodeC]);
+
+      const events = rejoinEvents();
+      expect(events).toHaveLength(1);
+      expect(events[0].severity).toBe(AnomalySeverity.WARNING);
+      expect(events[0].message).toContain('2788');
+      expect(events[0].message).toContain('CLUSTER FORGET removedCCCC');
+      expect(events[0].message).toContain('EVERY remaining node');
+    });
+
+    it('stays silent for a node that only flapped without leaving the view', async () => {
+      await pollWith([nodeA, nodeB, nodeC]);
+      await pollWith([
+        nodeA,
+        nodeB,
+        rnode('removedCCCC', '10.0.0.3:6379@16379', ['master', 'fail']),
+      ]);
+      await pollWith([
+        nodeA,
+        nodeB,
+        rnode('removedCCCC', '10.0.0.3:6379@16379', ['master', 'fail']),
+      ]);
+      await pollWith([nodeA, nodeB, nodeC]);
+
+      expect(rejoinEvents()).toEqual([]);
+    });
+
+    it('stays silent for a genuinely new node joining the cluster', async () => {
+      await pollWith([nodeA, nodeB]);
+      await pollWith([nodeA, nodeB]);
+      await pollWith([nodeA, nodeB, nodeC]);
+
+      expect(rejoinEvents()).toEqual([]);
+    });
+
+    it('does not treat a failed CLUSTER NODES fetch as a mass departure', async () => {
+      await pollWith([nodeA, nodeB, nodeC]);
+
+      now += 10_000;
+      (dbClient.getClusterNodes as jest.Mock).mockRejectedValue(new Error('CLUSTER NODES failed'));
+      await poll();
+      now += 10_000;
+      (dbClient.getClusterNodes as jest.Mock).mockRejectedValue(new Error('CLUSTER NODES failed'));
+      await poll();
+
+      await pollWith([nodeA, nodeB, nodeC]);
+
+      expect(rejoinEvents()).toEqual([]);
+    });
+
+    it('clears membership history on connection removal', async () => {
+      await pollWith([nodeA, nodeB, nodeC]);
+      expect((service as any).ghostHistories.has('conn-1')).toBe(true);
+
+      (service as any).onConnectionRemoved('conn-1');
+
+      expect((service as any).ghostHistories.has('conn-1')).toBe(false);
+    });
+  });
+
+  // ─── connection exhaustion / admin lockout (valkey#3944) ───────────────────
+
+  describe('client lockout risk', () => {
+    function infoWith(overrides: Record<string, string>) {
+      return {
+        server: { role: 'master' },
+        clients: {
+          connected_clients: overrides.connected_clients ?? '100',
+          blocked_clients: overrides.blocked_clients ?? '0',
+          maxclients: overrides.maxclients ?? '1000',
+        },
+        memory: { used_memory: '1000000', allocator_frag_ratio: '1.1' },
+        stats: {
+          instantaneous_ops_per_sec: '100',
+          instantaneous_input_kbps: '50',
+          instantaneous_output_kbps: '30',
+          evicted_keys: '0',
+          keyspace_misses: '5',
+          rejected_connections: overrides.rejected_connections ?? '0',
+          acl_access_denied_auth: '0',
+        },
+      };
+    }
+
+    async function pollWith(overrides: Record<string, string>): Promise<void> {
+      (dbClient.getInfoParsed as jest.Mock).mockResolvedValue(infoWith(overrides));
+      await poll();
+    }
+
+    const lockoutEvents = () => {
+      return service.getRecentEvents().filter((e) => {
+        return e.metricType === MetricType.CLIENT_LOCKOUT_RISK;
+      });
+    };
+
+    it('emits a WARNING only once the pressure is sustained', async () => {
+      await pollWith({ connected_clients: '900' });
+      await pollWith({ connected_clients: '900' });
+      expect(lockoutEvents()).toHaveLength(0);
+
+      await pollWith({ connected_clients: '900' });
+
+      const events = lockoutEvents();
+      expect(events).toHaveLength(1);
+      expect(events[0].severity).toBe(AnomalySeverity.WARNING);
+      expect(events[0].message).toContain('maxclients');
+      expect(events[0].message).toContain('priority-net-sources');
+    });
+
+    it('emits CRITICAL when connections are refused against a sustained full pool', async () => {
+      await pollWith({ connected_clients: '990', rejected_connections: '10' });
+      await pollWith({ connected_clients: '1000', rejected_connections: '10' });
+      await pollWith({ connected_clients: '1000', rejected_connections: '10' });
+      await pollWith({ connected_clients: '1000', rejected_connections: '25' });
+
+      const events = lockoutEvents();
+      const critical = events.find((e) => {
+        return e.severity === AnomalySeverity.CRITICAL;
+      });
+      expect(critical).toBeDefined();
+      expect(critical?.message).toContain('turning connections away right now');
+    });
+
+    it('reports only WARNING when refusals arrive without sustained utilization', async () => {
+      await pollWith({ connected_clients: '100', rejected_connections: '10' });
+      await pollWith({ connected_clients: '120', rejected_connections: '25' });
+
+      const events = lockoutEvents();
+      expect(events).toHaveLength(1);
+      expect(events[0].severity).toBe(AnomalySeverity.WARNING);
+    });
+
+    it('retries the advisory on the next poll when the storage write fails', async () => {
+      storage.saveAnomalyEvent.mockRejectedValueOnce(new Error('storage down'));
+
+      await pollWith({ connected_clients: '100', rejected_connections: '10' });
+      await pollWith({ connected_clients: '120', rejected_connections: '25' });
+
+      // The event reached the in-memory ring but was never persisted, so the
+      // hysteresis must not have advanced.
+      expect(storage.saveAnomalyEvent).toHaveBeenCalled();
+      const first = lockoutEvents();
+      expect(first).toHaveLength(1);
+      expect(first[0].persisted).not.toBe(true);
+
+      await pollWith({ connected_clients: '130', rejected_connections: '25' });
+
+      const retried = lockoutEvents();
+      expect(retried).toHaveLength(2);
+      expect(retried.some((e) => e.persisted === true)).toBe(true);
+    });
+
+    it('describes a refusal-only WARNING as refusals, not as sustained saturation', async () => {
+      await pollWith({ connected_clients: '100', rejected_connections: '10' });
+      await pollWith({ connected_clients: '120', rejected_connections: '25' });
+
+      const [event] = lockoutEvents();
+      // Names the actual signal...
+      expect(event.message).toContain('15 new connection(s) refused');
+      // ...and must not claim the pool held above the ceiling, which it never did.
+      expect(event.message).not.toContain('consecutive polls');
+    });
+
+    it('stays silent for a busy but sub-threshold pool', async () => {
+      for (let i = 0; i < 6; i++) {
+        await pollWith({ connected_clients: '700' });
+      }
+      expect(lockoutEvents()).toEqual([]);
+    });
+
+    it('clears lockout state on connection removal', async () => {
+      await pollWith({ connected_clients: '900' });
+      expect((service as any).clientLockoutState.has('conn-1')).toBe(true);
+
+      (service as any).onConnectionRemoved('conn-1');
+
+      expect((service as any).clientLockoutState.has('conn-1')).toBe(false);
+    });
+  });
+
+  // ─── auth-failure burst from the audit store (valkey#334) ──────────────────
+
+  describe('auth failure burst', () => {
+    function aclRow(overrides: Record<string, unknown> = {}) {
+      return {
+        id: 0,
+        count: 20,
+        reason: 'auth',
+        context: 'toplevel',
+        object: 'AUTH',
+        username: 'default',
+        ageSeconds: 1,
+        clientInfo: 'id=7 addr=203.0.113.9:51234 laddr=10.0.0.1:6379 fd=8 name=',
+        // Inside the 5-minute window, in ms, relative to the mocked clock.
+        timestampCreated: 1_700_000_000_000 - 60_000,
+        timestampLastUpdated: 1_700_000_000_000 - 30_000,
+        capturedAt: 1_700_000_000,
+        sourceHost: '10.0.0.1',
+        sourcePort: 6379,
+        connectionId: 'conn-1',
+        ...overrides,
+      };
+    }
+
+    let now: number;
+
+    beforeEach(() => {
+      now = 1_700_000_000_000;
+      jest.spyOn(Date, 'now').mockImplementation(() => now);
+    });
+
+    afterEach(() => {
+      (Date.now as jest.Mock).mockRestore();
+    });
+
+    const authEvents = () => {
+      return service.getRecentEvents().filter((e) => {
+        return e.metricType === MetricType.AUTH_FAILURE_BURST;
+      });
+    };
+
+    it('emits a WARNING naming the offending client address', async () => {
+      // Created inside the window, so its whole count is recent.
+      storage.getAclEntries.mockResolvedValue([aclRow()]);
+      await poll();
+
+      const events = authEvents();
+      expect(events).toHaveLength(1);
+      expect(events[0].severity).toBe(AnomalySeverity.WARNING);
+      expect(events[0].message).toContain('203.0.113.9');
+      expect(events[0].value).toBe(20);
+    });
+
+    it('accumulates growth on an entry that predates the window', async () => {
+      const old = 1_700_000_000_000 - 60 * 60 * 1000;
+      storage.getAclEntries.mockResolvedValue([aclRow({ count: 100, timestampCreated: old })]);
+      await poll();
+      expect(authEvents()).toEqual([]);
+
+      now += 31_000;
+      storage.getAclEntries.mockResolvedValue([aclRow({ count: 118, timestampCreated: old })]);
+      await poll();
+
+      const events = authEvents();
+      expect(events).toHaveLength(1);
+      expect(events[0].value).toBe(18);
+    });
+
+    it('never leaks key names or raw client-info into the event', async () => {
+      storage.getAclEntries.mockResolvedValue([
+        aclRow({ reason: 'key', count: 5, object: 'secret:customer:pii' }),
+        aclRow({ timestampCreated: 1_700_000_000_000 - 90_000, count: 20 }),
+      ]);
+      await poll();
+
+      const [event] = authEvents();
+      expect(event.message).not.toContain('secret:customer:pii');
+      expect(event.message).not.toContain('laddr=');
+      expect(event.message).not.toContain('fd=8');
+    });
+
+    it('does not filter the audit query on captured_at', async () => {
+      storage.getAclEntries.mockResolvedValue([]);
+      await poll();
+
+      // The store upserts one row per logical entry, so an entry under active
+      // attack keeps its original captured_at while its count climbs. Filtering
+      // on it would hide exactly the entries that matter.
+      const [options] = storage.getAclEntries.mock.calls[0];
+      expect(options).toEqual({ connectionId: 'conn-1', limit: 2000 });
+    });
+
+    it('baselines an unseen entry rather than alerting on its lifetime count', async () => {
+      // Created hours ago: its 400 failures are not this window's.
+      storage.getAclEntries.mockResolvedValue([
+        aclRow({ count: 400, timestampCreated: 1_700_000_000_000 - 4 * 60 * 60 * 1000 }),
+      ]);
+      await poll();
+
+      expect(authEvents()).toEqual([]);
+    });
+
+    it('throttles the store scan rather than querying on every poll', async () => {
+      storage.getAclEntries.mockResolvedValue([]);
+      await poll();
+      await poll();
+      await poll();
+      expect(storage.getAclEntries).toHaveBeenCalledTimes(1);
+
+      now += 31_000;
+      await poll();
+      expect(storage.getAclEntries).toHaveBeenCalledTimes(2);
+    });
+
+    it('stays silent when the audit store has nothing (ACL LOG unavailable or audit off)', async () => {
+      storage.getAclEntries.mockResolvedValue([]);
+      await poll();
+      expect(authEvents()).toEqual([]);
+    });
+
+    it('does not re-alert the same address on the next scan', async () => {
+      storage.getAclEntries.mockResolvedValue([aclRow()]);
+      await poll();
+      now += 31_000;
+      await poll();
+
+      expect(authEvents()).toHaveLength(1);
+    });
+
+    it('survives a storage failure without breaking the poll', async () => {
+      storage.getAclEntries.mockRejectedValue(new Error('storage down'));
+      await expect(poll()).resolves.not.toThrow();
+      expect(authEvents()).toEqual([]);
+    });
+
+    it('clears auth-failure state on connection removal', async () => {
+      storage.getAclEntries.mockResolvedValue([aclRow()]);
+      await poll();
+      expect((service as any).authFailureState.has('conn-1')).toBe(true);
+
+      (service as any).onConnectionRemoved('conn-1');
+
+      expect((service as any).authFailureState.has('conn-1')).toBe(false);
+      expect((service as any).authFailureLastScan.has('conn-1')).toBe(false);
+    });
+  });
+
+  // ─── ACL drift / reload confirmation (valkey#4355) ─────────────────────────
+
+  describe('ACL drift', () => {
+    const DEFAULT_LINE = 'user default on nopass ~* &* +@all';
+    const APP_LINE = 'user app on #a3b1 ~cache:* +@read';
+    const APP_LINE_WIDER = 'user app on #a3b1 ~cache:* ~secret:* +@read';
+
+    function replInfo(replid = 'shared-replid') {
+      return {
+        server: { role: 'master' },
+        clients: { connected_clients: '10', blocked_clients: '0' },
+        memory: { used_memory: '1000000', allocator_frag_ratio: '1.1' },
+        stats: {
+          instantaneous_ops_per_sec: '100',
+          instantaneous_input_kbps: '50',
+          instantaneous_output_kbps: '30',
+          evicted_keys: '0',
+          keyspace_misses: '5',
+          rejected_connections: '0',
+          acl_access_denied_auth: '0',
+        },
+        replication: { role: 'master', master_replid: replid },
+      };
+    }
+
+    let now: number;
+
+    beforeEach(() => {
+      (dbClient.getInfoParsed as jest.Mock).mockResolvedValue(replInfo());
+      dbClient.getAclList = jest.fn().mockResolvedValue([DEFAULT_LINE, APP_LINE]);
+      now = 1_700_000_000_000;
+      jest.spyOn(Date, 'now').mockImplementation(() => now);
+    });
+
+    afterEach(() => {
+      (Date.now as jest.Mock).mockRestore();
+    });
+
+    const driftEvents = () => {
+      return service.getRecentEvents().filter((e) => {
+        return e.metricType === MetricType.ACL_DRIFT;
+      });
+    };
+
+    /** Seed a second connection's slice of the shared snapshot. */
+    function seedPeer(connectionId: string, lines: string[], replid = 'shared-replid'): void {
+      const { digest, userDigests } = nodeAclDigest(lines);
+      (service as any).aclSnapshot.set(connectionId, {
+        groupKey: `replid:${replid}`,
+        name: connectionId,
+        digest,
+        userDigests,
+      });
+    }
+
+    it('stays silent when the group agrees', async () => {
+      seedPeer('conn-peer', [DEFAULT_LINE, APP_LINE]);
+      await poll();
+      expect(driftEvents()).toEqual([]);
+    });
+
+    it('emits a WARNING naming the differing user when a peer diverges', async () => {
+      seedPeer('conn-peer', [DEFAULT_LINE, APP_LINE_WIDER]);
+      await poll();
+
+      const events = driftEvents();
+      expect(events).toHaveLength(1);
+      expect(events[0].severity).toBe(AnomalySeverity.WARNING);
+      expect(events[0].message).toContain('app');
+      expect(events[0].message).toContain('4355');
+    });
+
+    it('re-alerts the drift on the next poll when the emit fails', async () => {
+      seedPeer('conn-peer', [DEFAULT_LINE, APP_LINE_WIDER]);
+      const addAnomaly = jest
+        .spyOn(service as any, 'addAnomaly')
+        .mockRejectedValueOnce(new Error('storage down'));
+
+      await expect(poll()).resolves.not.toThrow();
+      expect(addAnomaly).toHaveBeenCalledTimes(1);
+      expect(driftEvents()).toEqual([]);
+
+      // The failed emit must NOT leave the signature marked active, or this
+      // security alert stays suppressed until the drift clears and recurs.
+      addAnomaly.mockRestore();
+      await poll();
+
+      const events = driftEvents();
+      expect(events).toHaveLength(1);
+      expect(events[0].severity).toBe(AnomalySeverity.WARNING);
+    });
+
+    it('re-alerts the drift when the storage write fails, not just when the emit throws', async () => {
+      // The production failure mode: addAnomaly CATCHES the storage error and
+      // resolves, leaving `persisted` unset. A rejection-only release would never
+      // fire here, so the drift would stay suppressed until it cleared and recurred.
+      seedPeer('conn-peer', [DEFAULT_LINE, APP_LINE_WIDER]);
+      storage.saveAnomalyEvent.mockRejectedValueOnce(new Error('storage down'));
+
+      await expect(poll()).resolves.not.toThrow();
+      const first = driftEvents();
+      expect(first).toHaveLength(1);
+      expect(first[0].persisted).not.toBe(true);
+
+      await poll();
+
+      const events = driftEvents();
+      expect(events).toHaveLength(2);
+      expect(events.some((e) => e.persisted === true)).toBe(true);
+    });
+
+    it('still emits the rest of the batch when one drift emit fails', async () => {
+      // Two groups drift in the same poll. The first emit throws; the second must
+      // still be delivered, and the failed one must re-alert on the next poll.
+      seedPeer('conn-peer', [DEFAULT_LINE, APP_LINE_WIDER]);
+      seedPeer('conn-other-a', [DEFAULT_LINE], 'second-replid');
+      seedPeer('conn-other-b', [DEFAULT_LINE, APP_LINE_WIDER], 'second-replid');
+
+      const addAnomaly = jest.spyOn(service as any, 'addAnomaly');
+      addAnomaly.mockRejectedValueOnce(new Error('storage down'));
+
+      await expect(poll()).resolves.not.toThrow();
+      expect(addAnomaly).toHaveBeenCalledTimes(2);
+      expect(driftEvents()).toHaveLength(1);
+
+      await poll();
+      expect(driftEvents()).toHaveLength(2);
+      addAnomaly.mockRestore();
+    });
+
+    it('never puts rule material into the event', async () => {
+      seedPeer('conn-peer', [DEFAULT_LINE, APP_LINE_WIDER]);
+      await poll();
+
+      const [event] = driftEvents();
+      expect(event.message).not.toContain('secret:*');
+      expect(event.message).not.toContain('#a3b1');
+      expect(event.message).not.toContain('+@all');
+    });
+
+    it('dedupes a persistent drift and re-alerts when the pattern changes', async () => {
+      seedPeer('conn-peer', [DEFAULT_LINE, APP_LINE_WIDER]);
+      await poll();
+      await poll();
+      expect(driftEvents()).toHaveLength(1);
+
+      seedPeer('conn-peer', [DEFAULT_LINE]);
+      await poll();
+      expect(driftEvents()).toHaveLength(2);
+    });
+
+    it('does not compare nodes in different replication groups', async () => {
+      seedPeer('conn-peer', [DEFAULT_LINE, APP_LINE_WIDER], 'other-replid');
+      await poll();
+      expect(driftEvents()).toEqual([]);
+    });
+
+    it('emits an INFO reload confirmation when this node adopts a new ruleset', async () => {
+      await poll();
+      expect(driftEvents()).toEqual([]);
+
+      (dbClient.getAclList as jest.Mock).mockResolvedValue([DEFAULT_LINE, APP_LINE_WIDER]);
+      // Exhaust the recheck countdown so the next read actually happens.
+      (service as any).aclDriftRecheck.set('conn-1', 0);
+      await poll();
+
+      const events = driftEvents();
+      expect(events).toHaveLength(1);
+      expect(events[0].severity).toBe(AnomalySeverity.INFO);
+      expect(events[0].message).toContain('ACL ruleset on this node changed');
+    });
+
+    it('throttles ACL LIST rather than reading it every poll', async () => {
+      await poll();
+      await poll();
+      await poll();
+      expect(dbClient.getAclList).toHaveBeenCalledTimes(1);
+    });
+
+    it('reports unverified once and drops the node when the ACL read is denied', async () => {
+      (dbClient.getAclList as jest.Mock).mockRejectedValue(new Error('NOPERM'));
+      await expect(poll()).resolves.not.toThrow();
+
+      expect((service as any).aclUnverified.has('conn-1')).toBe(true);
+      expect((service as any).aclSnapshot.has('conn-1')).toBe(false);
+      expect(driftEvents()).toEqual([]);
+    });
+
+    it('does not report a group as consistent using a stale slice after a denial', async () => {
+      await poll();
+      expect((service as any).aclSnapshot.has('conn-1')).toBe(true);
+
+      (dbClient.getAclList as jest.Mock).mockRejectedValue(new Error('NOPERM'));
+      (service as any).aclDriftRecheck.set('conn-1', 0);
+      await poll();
+
+      expect((service as any).aclSnapshot.has('conn-1')).toBe(false);
+    });
+
+    it('backs off instead of re-issuing a denied ACL LIST every poll', async () => {
+      (dbClient.getAclList as jest.Mock).mockRejectedValue(new Error('NOPERM'));
+
+      await poll();
+      expect(dbClient.getAclList).toHaveBeenCalledTimes(1);
+
+      // Without a backoff this would issue one NOPERM ACL LIST per poll, each
+      // writing an ACL LOG entry this same service then reports.
+      for (let i = 0; i < 5; i++) {
+        now += 1_000;
+        await poll();
+      }
+      expect(dbClient.getAclList).toHaveBeenCalledTimes(1);
+
+      now += 5 * 60_000 + 1;
+      await poll();
+      expect(dbClient.getAclList).toHaveBeenCalledTimes(2);
+    });
+
+    it('keeps the last-known slice when the ACL read fails transiently', async () => {
+      await poll();
+      expect((service as any).aclSnapshot.has('conn-1')).toBe(true);
+
+      // LOADING during a failover says nothing about our permissions. Dropping
+      // the slice would clear active drift and re-alert it as new on recovery.
+      (dbClient.getAclList as jest.Mock).mockRejectedValue(
+        new Error('LOADING Valkey is loading the dataset in memory'),
+      );
+      (service as any).aclDriftRecheck.set('conn-1', 0);
+      await poll();
+
+      expect((service as any).aclSnapshot.has('conn-1')).toBe(true);
+      expect((service as any).aclDeniedUntil.has('conn-1')).toBe(false);
+      expect((service as any).aclUnverified.has('conn-1')).toBe(false);
+    });
+
+    it('resumes normal cadence once the ACL read succeeds again', async () => {
+      (dbClient.getAclList as jest.Mock).mockRejectedValue(new Error('NOPERM'));
+      await poll();
+
+      (dbClient.getAclList as jest.Mock).mockResolvedValue([DEFAULT_LINE, APP_LINE]);
+      now += 5 * 60_000 + 1;
+      await poll();
+
+      expect((service as any).aclDeniedUntil.has('conn-1')).toBe(false);
+      expect((service as any).aclSnapshot.has('conn-1')).toBe(true);
+    });
+
+    it('clears ACL state on connection removal', async () => {
+      await poll();
+      expect((service as any).aclSnapshot.has('conn-1')).toBe(true);
+
+      (service as any).onConnectionRemoved('conn-1');
+
+      expect((service as any).aclSnapshot.has('conn-1')).toBe(false);
+      expect((service as any).aclDriftRecheck.has('conn-1')).toBe(false);
+      expect((service as any).aclUnverified.has('conn-1')).toBe(false);
+      expect((service as any).aclDeniedUntil.has('conn-1')).toBe(false);
+    });
+  });
+
+  // ─── Sentinel endpoint drift (valkey#2158) ─────────────────────────────────
+
+  describe('Sentinel endpoint drift', () => {
+    function sentinelNode(partial: Partial<SentinelNodeInfo> = {}): SentinelNodeInfo {
+      return {
+        name: 'mymaster',
+        ip: 'valkey-0.valkey-headless',
+        port: 6379,
+        runid: 'r1',
+        flags: ['master'],
+        fields: {},
+        ...partial,
+      };
+    }
+
+    function sentinelInfo(mode = 'sentinel', modeField = 'redis_mode') {
+      return {
+        server: { role: 'master', [modeField]: mode },
+        clients: { connected_clients: '10', blocked_clients: '0' },
+        memory: { used_memory: '1000000', allocator_frag_ratio: '1.1' },
+        stats: {
+          instantaneous_ops_per_sec: '100',
+          instantaneous_input_kbps: '50',
+          instantaneous_output_kbps: '30',
+          evicted_keys: '0',
+          keyspace_misses: '5',
+          rejected_connections: '0',
+          acl_access_denied_auth: '0',
+        },
+      };
+    }
+
+    const driftedReplica = sentinelNode({
+      name: '10.244.3.7:6379',
+      ip: '10.244.3.7',
+      flags: ['slave'],
+      masterHost: 'valkey-0.valkey-headless',
+      masterPort: 6379,
+    });
+
+    const healthyReplica = sentinelNode({
+      name: 'valkey-1.valkey-headless:6379',
+      ip: 'valkey-1.valkey-headless',
+      flags: ['slave'],
+      masterHost: 'valkey-0.valkey-headless',
+      masterPort: 6379,
+    });
+
+    let now: number;
+
+    beforeEach(() => {
+      (dbClient.getInfoParsed as jest.Mock).mockResolvedValue(sentinelInfo());
+      dbClient.getSentinelMasters = jest.fn().mockResolvedValue([sentinelNode()]);
+      dbClient.getSentinelReplicas = jest.fn().mockResolvedValue([healthyReplica]);
+      now = 1_700_000_000_000;
+      jest.spyOn(Date, 'now').mockImplementation(() => now);
+    });
+
+    afterEach(() => {
+      (Date.now as jest.Mock).mockRestore();
+    });
+
+    const sentinelEvents = () => {
+      return service.getRecentEvents().filter((e) => {
+        return e.metricType === MetricType.SENTINEL_ENDPOINT_DRIFT;
+      });
+    };
+
+    /** Two probes either side of the 60s persistence gate. */
+    async function pollPastGate(): Promise<void> {
+      await poll();
+      now += 61_000;
+      await poll();
+    }
+
+    it('emits a WARNING once an IP-for-hostname entry persists past the gate', async () => {
+      (dbClient.getSentinelReplicas as jest.Mock).mockResolvedValue([
+        healthyReplica,
+        driftedReplica,
+      ]);
+
+      await poll();
+      expect(sentinelEvents()).toHaveLength(0);
+
+      now += 61_000;
+      await poll();
+
+      const events = sentinelEvents();
+      expect(events).toHaveLength(1);
+      expect(events[0].severity).toBe(AnomalySeverity.WARNING);
+      expect(events[0].message).toContain('10.244.3.7:6379');
+      expect(events[0].message).toContain('2158');
+    });
+
+    it('stays silent for a hostname-consistent Sentinel view', async () => {
+      await pollPastGate();
+      expect(sentinelEvents()).toEqual([]);
+    });
+
+    it('emits CRITICAL for a node configured as a replica of itself', async () => {
+      (dbClient.getSentinelReplicas as jest.Mock).mockResolvedValue([
+        sentinelNode({
+          name: 'valkey-1.valkey-headless:6379',
+          ip: 'valkey-1.valkey-headless',
+          flags: ['slave'],
+          masterHost: 'valkey-1.valkey-headless',
+          masterPort: 6379,
+        }),
+      ]);
+
+      await pollPastGate();
+
+      const events = sentinelEvents();
+      expect(events).toHaveLength(1);
+      expect(events[0].severity).toBe(AnomalySeverity.CRITICAL);
+      expect(events[0].message).toContain('replica of itself');
+    });
+
+    it('suppresses a transient post-failover entry that reconverges inside the gate', async () => {
+      (dbClient.getSentinelReplicas as jest.Mock).mockResolvedValue([
+        healthyReplica,
+        driftedReplica,
+      ]);
+      await poll();
+
+      (dbClient.getSentinelReplicas as jest.Mock).mockResolvedValue([healthyReplica]);
+      now += 61_000;
+      await poll();
+
+      expect(sentinelEvents()).toEqual([]);
+    });
+
+    it('never issues a SENTINEL command on a non-Sentinel connection', async () => {
+      (dbClient.getInfoParsed as jest.Mock).mockResolvedValue(sentinelInfo('standalone'));
+
+      await pollPastGate();
+
+      expect(dbClient.getSentinelMasters).not.toHaveBeenCalled();
+      expect(sentinelEvents()).toEqual([]);
+    });
+
+    it.each(['server_mode', 'valkey_mode'])(
+      'detects a Sentinel that reports its mode as %s',
+      async (modeField) => {
+        (dbClient.getInfoParsed as jest.Mock).mockResolvedValue(
+          sentinelInfo('sentinel', modeField),
+        );
+        (dbClient.getSentinelReplicas as jest.Mock).mockResolvedValue([
+          healthyReplica,
+          driftedReplica,
+        ]);
+
+        await pollPastGate();
+
+        expect(dbClient.getSentinelMasters).toHaveBeenCalled();
+        expect(sentinelEvents()).toHaveLength(1);
+      },
+    );
+
+    it('never issues a SENTINEL command when server_mode is not sentinel', async () => {
+      (dbClient.getInfoParsed as jest.Mock).mockResolvedValue(
+        sentinelInfo('standalone', 'server_mode'),
+      );
+
+      await pollPastGate();
+
+      expect(dbClient.getSentinelMasters).not.toHaveBeenCalled();
+      expect(sentinelEvents()).toEqual([]);
+    });
+
+    it('throttles the Sentinel probe rather than running it every poll', async () => {
+      await poll();
+      await poll();
+      await poll();
+      expect(dbClient.getSentinelMasters).toHaveBeenCalledTimes(1);
+
+      now += 16_000;
+      await poll();
+      expect(dbClient.getSentinelMasters).toHaveBeenCalledTimes(2);
+    });
+
+    it('keeps the rest of the view when one master read fails', async () => {
+      dbClient.getSentinelMasters = jest
+        .fn()
+        .mockResolvedValue([sentinelNode(), sentinelNode({ name: 'other' })]);
+      (dbClient.getSentinelReplicas as jest.Mock).mockImplementation((name: string) => {
+        if (name === 'other') {
+          return Promise.reject(new Error('unknown master'));
+        }
+        return Promise.resolve([healthyReplica, driftedReplica]);
+      });
+
+      await pollPastGate();
+
+      expect(sentinelEvents()).toHaveLength(1);
+    });
+
+    it('does not read a failed replica fetch as recovery for that master', async () => {
+      (dbClient.getSentinelReplicas as jest.Mock).mockResolvedValue([
+        healthyReplica,
+        driftedReplica,
+      ]);
+      await pollPastGate();
+      expect(sentinelEvents()).toHaveLength(1);
+
+      // The replica read now fails for a few polls. The drift is unobserved, not
+      // resolved — treating it as recovery would clear the gate and re-alert.
+      (dbClient.getSentinelReplicas as jest.Mock).mockRejectedValue(new Error('mid-failover'));
+      for (let i = 0; i < 3; i++) {
+        now += 61_000;
+        await poll();
+      }
+
+      (dbClient.getSentinelReplicas as jest.Mock).mockResolvedValue([
+        healthyReplica,
+        driftedReplica,
+      ]);
+      now += 61_000;
+      await poll();
+
+      expect(sentinelEvents()).toHaveLength(1);
+    });
+
+    it('survives a Sentinel command failure without breaking the poll', async () => {
+      dbClient.getSentinelMasters = jest.fn().mockRejectedValue(new Error('unknown command'));
+
+      await expect(poll()).resolves.not.toThrow();
+      expect(sentinelEvents()).toEqual([]);
+    });
+
+    it('clears Sentinel state on connection removal', async () => {
+      await poll();
+      expect((service as any).sentinelLastProbe.has('conn-1')).toBe(true);
+
+      (service as any).onConnectionRemoved('conn-1');
+
+      expect((service as any).sentinelLastProbe.has('conn-1')).toBe(false);
+      expect((service as any).sentinelDriftFirstSeen.has('conn-1')).toBe(false);
+      expect((service as any).activeSentinelDrifts.has('conn-1')).toBe(false);
     });
   });
 });

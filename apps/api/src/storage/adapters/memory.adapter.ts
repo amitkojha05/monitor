@@ -60,6 +60,8 @@ import type {
   VectorIndexSnapshotQueryOptions,
   MetricForecastSettings,
   MetricKind,
+  StoredCveDataset,
+  CveScanResult,
   StoredCacheProposal,
   StoredCacheProposalAudit,
   CreateCacheProposalInput,
@@ -77,6 +79,7 @@ import {
   PROPOSAL_DEFAULT_EXPIRY_MS,
   variantPayloadSchemaFor,
   MEMORY_PROPOSAL_DEFAULT_EXPIRY_MS,
+  memoryForgetTargetDiscriminator,
 } from '@betterdb/shared';
 import { WebhookMemoryRepository } from './repositories/webhook.memory.repository';
 import { SlowLogMemoryRepository } from './repositories/slowlog.memory.repository';
@@ -98,16 +101,6 @@ function pendingProposalSubDiscriminator(
   return null;
 }
 
-function memoryProposalTargetDiscriminator(payload: unknown): string {
-  const p = payload as Record<string, unknown> | null | undefined;
-  if (p?.target_kind === 'id') {
-    return `id:${String(p.memory_id)}`;
-  }
-  const scope = (p?.scope ?? {}) as Record<string, unknown>;
-  const tags = Array.isArray(p?.tags) ? [...(p.tags as string[])].sort() : [];
-  return `scope:${JSON.stringify(scope)}|tags:${tags.join(',')}`;
-}
-
 export class MemoryAdapter implements StoragePort {
   private aclEntries: StoredAclEntry[] = [];
   private clientSnapshots: StoredClientSnapshot[] = [];
@@ -119,6 +112,8 @@ export class MemoryAdapter implements StoragePort {
   private latencyHistograms: StoredLatencyHistogram[] = [];
   private memorySnapshots: StoredMemorySnapshot[] = [];
   private vectorIndexSnapshots: VectorIndexSnapshot[] = [];
+  private cveDataset: StoredCveDataset | null = null;
+  private cveScanResults: CveScanResult[] = [];
   private metricForecastSettings: Map<string, MetricForecastSettings> = new Map();
   private settings: AppSettings | null = null;
   private readonly MAX_DELIVERIES_PER_WEBHOOK = 1000;
@@ -161,6 +156,7 @@ export class MemoryAdapter implements StoragePort {
           ...this.aclEntries[existingIndex],
           count: entry.count,
           ageSeconds: entry.ageSeconds,
+          clientInfo: entry.clientInfo,
           timestampLastUpdated: entry.timestampLastUpdated,
           capturedAt: entry.capturedAt,
         };
@@ -774,7 +770,10 @@ export class MemoryAdapter implements StoragePort {
     _cutoffTimestamp: number,
     _connectionId?: string,
   ): Promise<number> {
-    throw new Error('Key analytics not supported in memory adapter');
+    // Nothing is ever stored here, so there is nothing to prune. Returning 0
+    // (instead of throwing like the read/write paths) keeps the retention
+    // sweep from logging an error on every pass with the memory backend.
+    return 0;
   }
 
   async saveHotKeys(_entries: HotKeyEntry[], _connectionId: string): Promise<number> {
@@ -786,7 +785,10 @@ export class MemoryAdapter implements StoragePort {
   }
 
   async pruneOldHotKeys(_cutoffTimestamp: number, _connectionId?: string): Promise<number> {
-    throw new Error('Hot key stats not supported in memory adapter');
+    // Nothing is ever stored here, so there is nothing to prune. Returning 0
+    // (instead of throwing like the read/write paths) keeps the retention
+    // sweep from logging an error on every pass with the memory backend.
+    return 0;
   }
 
   async getSettings(): Promise<AppSettings | null> {
@@ -842,6 +844,8 @@ export class MemoryAdapter implements StoragePort {
     }
     if (updates.anomalyDetectorConfig !== undefined) {
       validUpdates.anomalyDetectorConfig = updates.anomalyDetectorConfig;
+    if (updates.localRetentionDays !== undefined) {
+      validUpdates.localRetentionDays = updates.localRetentionDays;
     }
 
     this.settings = {
@@ -1434,6 +1438,51 @@ export class MemoryAdapter implements StoragePort {
     return before - this.vectorIndexSnapshots.length;
   }
 
+  // CVE Inspection Methods
+  async saveCveDataset(dataset: StoredCveDataset): Promise<void> {
+    this.cveDataset = structuredClone(dataset);
+  }
+
+  async getCveDataset(): Promise<StoredCveDataset | null> {
+    if (!this.cveDataset) {
+      return null;
+    }
+
+    return structuredClone(this.cveDataset);
+  }
+
+  async saveCveScanResult(result: CveScanResult): Promise<void> {
+    const otherConnections = this.cveScanResults.filter((entry) => {
+      return entry.connectionId !== result.connectionId;
+    });
+    const forConnection = this.cveScanResults.filter((entry) => {
+      return entry.connectionId === result.connectionId;
+    });
+    forConnection.push(structuredClone(result));
+
+    const newest = forConnection.reduce((current, entry) => {
+      return entry.scannedAt >= current.scannedAt ? entry : current;
+    });
+
+    this.cveScanResults = [...otherConnections, newest];
+  }
+
+  async getCveScanResult(connectionId: string): Promise<CveScanResult | null> {
+    const forConnection = this.cveScanResults.filter((entry) => {
+      return entry.connectionId === connectionId;
+    });
+
+    if (forConnection.length === 0) {
+      return null;
+    }
+
+    const newest = forConnection.reduce((current, entry) => {
+      return entry.scannedAt >= current.scannedAt ? entry : current;
+    });
+
+    return structuredClone(newest);
+  }
+
   // Connection Management Methods (in-memory storage)
   private connections: Map<string, DatabaseConnectionConfig> = new Map();
 
@@ -1737,13 +1786,18 @@ export class MemoryAdapter implements StoragePort {
   }
 
   async createMemoryProposal(input: CreateMemoryProposalInput): Promise<StoredMemoryProposal> {
-    const discriminator = memoryProposalTargetDiscriminator(input.proposal_payload);
+    const discriminator = memoryForgetTargetDiscriminator(input.proposal_payload);
     for (const existing of this.memoryProposals.values()) {
+      // Matched on the stored column, not re-derived from the payload, so this
+      // stays equivalent to the partial unique index even when an explicit
+      // discriminator is supplied. Null is outside that index, so it never
+      // collides here either.
       if (
         existing.status === 'pending' &&
         existing.connection_id === input.connection_id &&
         existing.store_name === input.store_name &&
-        memoryProposalTargetDiscriminator(existing.proposal_payload) === discriminator
+        existing.target_discriminator !== null &&
+        existing.target_discriminator === discriminator
       ) {
         throw new Error(
           `UNIQUE constraint failed: memory_proposals (connection_id, store_name, target) where status='pending'`,
@@ -1760,9 +1814,11 @@ export class MemoryAdapter implements StoragePort {
       proposed_at: proposedAt,
       reviewed_by: null,
       reviewed_at: null,
+      applying_at: null,
       applied_at: null,
       applied_result: null,
       expires_at: expiresAt,
+      target_discriminator: discriminator,
     });
     this.memoryProposals.set(proposal.id, proposal);
     return structuredClone(proposal);
@@ -1816,6 +1872,9 @@ export class MemoryAdapter implements StoragePort {
     if (input.reviewed_at !== undefined) {
       updated.reviewed_at = input.reviewed_at;
     }
+    if (input.applying_at !== undefined) {
+      updated.applying_at = input.applying_at;
+    }
     if (input.applied_at !== undefined) {
       updated.applied_at = input.applied_at;
     }
@@ -1863,6 +1922,51 @@ export class MemoryAdapter implements StoragePort {
       }
     }
     return expired;
+  }
+
+  async failStaleApplyingMemoryProposalsBefore(cutoff: number): Promise<StoredMemoryProposal[]> {
+    const swept: StoredMemoryProposal[] = [];
+    for (const proposal of this.memoryProposals.values()) {
+      const claimedAt = proposal.applying_at;
+      if (proposal.status !== 'applying' || claimedAt === null || claimedAt === undefined) {
+        continue;
+      }
+      if (claimedAt > cutoff) {
+        continue;
+      }
+      const updated = structuredClone({
+        ...proposal,
+        status: 'failed' as const,
+        applied_at: Date.now(),
+        applied_result: {
+          success: false,
+          error: 'apply presumed dead',
+          details: { reason: 'stale_apply', partial: 'unknown' },
+        },
+      });
+      this.memoryProposals.set(proposal.id, updated);
+      swept.push(structuredClone(updated));
+    }
+    return swept;
+  }
+
+  async countPendingMemoryProposalsByTarget(input: {
+    connection_id: string;
+    store_name: string;
+    target_discriminator: string;
+  }): Promise<number> {
+    let count = 0;
+    for (const proposal of this.memoryProposals.values()) {
+      if (
+        proposal.status === 'pending' &&
+        proposal.connection_id === input.connection_id &&
+        proposal.store_name === input.store_name &&
+        proposal.target_discriminator === input.target_discriminator
+      ) {
+        count++;
+      }
+    }
+    return count;
   }
 
   async saveCaptureSession(

@@ -1,4 +1,5 @@
-import Database from 'better-sqlite3';
+import type Database from 'better-sqlite3';
+import { chunkedSqliteDelete } from '../sqlite-chunked-delete';
 import {
   SlowLogQueryOptions,
   StoredSlowLogEntry,
@@ -46,7 +47,7 @@ export class SlowLogSqliteRepository {
 
   async getSlowLogEntries(options: SlowLogQueryOptions = {}): Promise<StoredSlowLogEntry[]> {
     const conditions: string[] = [];
-    const params: any[] = [];
+    const params: unknown[] = [];
 
     if (options.connectionId) {
       conditions.push('connection_id = ?');
@@ -92,7 +93,7 @@ export class SlowLogSqliteRepository {
        ${orderBy}
        LIMIT ? OFFSET ?`,
       )
-      .all(...params, limit, offset) as any[];
+      .all(...params, limit, offset) as Record<string, unknown>[];
 
     return rows.map((row) => this.mappers.mapSlowLogEntryRow(row));
   }
@@ -101,27 +102,24 @@ export class SlowLogSqliteRepository {
     if (connectionId) {
       const row = this.db
         .prepare('SELECT MAX(slowlog_id) as max_id FROM slow_log_entries WHERE connection_id = ?')
-        .get(connectionId) as any;
+        .get(connectionId) as { max_id: number | null } | undefined;
       return row?.max_id ?? null;
     }
 
-    const row = this.db
-      .prepare('SELECT MAX(slowlog_id) as max_id FROM slow_log_entries')
-      .get() as any;
+    const row = this.db.prepare('SELECT MAX(slowlog_id) as max_id FROM slow_log_entries').get() as
+      | { max_id: number | null }
+      | undefined;
     return row?.max_id ?? null;
   }
 
   async pruneOldSlowLogEntries(cutoffTimestamp: number, connectionId?: string): Promise<number> {
     if (connectionId) {
-      const result = this.db
-        .prepare('DELETE FROM slow_log_entries WHERE captured_at < ? AND connection_id = ?')
-        .run(cutoffTimestamp, connectionId);
-      return result.changes;
+      return chunkedSqliteDelete(this.db, 'slow_log_entries', 'captured_at < ? AND connection_id = ?', [
+        cutoffTimestamp,
+        connectionId,
+      ]);
     }
 
-    const result = this.db
-      .prepare('DELETE FROM slow_log_entries WHERE captured_at < ?')
-      .run(cutoffTimestamp);
-    return result.changes;
+    return chunkedSqliteDelete(this.db, 'slow_log_entries', 'captured_at < ?', [cutoffTimestamp]);
   }
 }

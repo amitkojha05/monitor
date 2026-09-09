@@ -49,7 +49,41 @@ import {
   detectOrphanedSlotKeys,
   orphanedSlotKeysSignature,
 } from './orphaned-slot-keys-detector';
-import { detectGhostMembers, ghostMemberSignature } from './ghost-membership-detector';
+import { GhostMember, detectGhostMembers, ghostMemberSignature } from './ghost-membership-detector';
+import { ForgetRejoin, GhostMembershipHistory } from './ghost-membership-history';
+import {
+  ClientLockoutFinding,
+  ClientLockoutState,
+  LOCKOUT_MIN_STREAK,
+  LOCKOUT_UTILIZATION_PCT,
+  commitClientLockoutLevel,
+  createClientLockoutState,
+  evaluateClientLockout,
+} from './client-lockout-detector';
+import {
+  SentinelDrift,
+  detectSentinelDrift,
+  isSentinelMode,
+  sentinelDriftSignature,
+  sentinelDriftSignatureMaster,
+} from './sentinel-drift-detector';
+import {
+  AclDrift,
+  AclDriftNode,
+  aclDriftSignature,
+  detectAclDrift,
+  nodeAclDigest,
+} from './acl-drift-detector';
+import {
+  AUTH_FAILURE_MIN_COUNT,
+  AUTH_FAILURE_QUERY_LIMIT,
+  AUTH_FAILURE_WINDOW_MS,
+  AuthFailureSource,
+  AuthFailureState,
+  createAuthFailureState,
+  observeAuthFailures,
+  takeAlertable,
+} from './auth-failure-detector';
 import { detectLaggingPromotion, ReplPeer } from './lagging-promotion-detector';
 import { detectHostnameStaleness, hostnameStalenessSignature } from './hostname-staleness-detector';
 import {
@@ -209,6 +243,37 @@ export class AnomalyService extends MultiConnectionPoller implements OnModuleIni
   // doesn't alert, `active` dedupes the alert once the gate has fired.
   private ghostMemberFirstSeen = new Map<string, Map<string, number>>();
   private activeGhostMembers = new Map<string, Set<string>>();
+  // Ghost-membership Layer 2 (valkey#2788): per-connection CLUSTER NODES
+  // membership history, the only way to see a FORGET-then-rejoin — no single
+  // snapshot distinguishes a resurrected node from an ordinary member.
+  private ghostHistories = new Map<string, GhostMembershipHistory>();
+  // Connection-exhaustion / admin-lockout (valkey#3944) state: streak + last
+  // level + last counters, one entry per connection.
+  private clientLockoutState = new Map<string, ClientLockoutState>();
+  // Auth-failure burst (valkey#334) state: per-address alert cooldown, plus the
+  // last time the audit-store window was scanned for this connection.
+  private authFailureState = new Map<string, AuthFailureState>();
+  private authFailureLastScan = new Map<string, number>();
+  // ACL drift (valkey#4355): this connection's last-known ACL fingerprint, the
+  // shared snapshot the cross-node comparison runs over. Same "shared snapshot,
+  // no fan-out" shape as configSnapshot.
+  private aclSnapshot = new Map<
+    string,
+    { groupKey: string; name?: string; digest: string; userDigests: Record<string, string> }
+  >();
+  private aclDriftRecheck = new Map<string, number>();
+  // Group-level dedupe (a drift is a property of the GROUP, not a connection).
+  private activeAclDriftSignatures = new Set<string>();
+  // Connections whose ACL read is currently denied — reported once, then held so
+  // an unreadable ACL surface doesn't alert every poll.
+  private aclUnverified = new Set<string>();
+  // Earliest timestamp at which a denied ACL LIST may be retried, per connection.
+  private aclDeniedUntil = new Map<string, number>();
+  // Sentinel endpoint drift (valkey#2158) state: persistence gate + dedupe, plus
+  // the last time the Sentinel view was probed for this connection.
+  private sentinelDriftFirstSeen = new Map<string, Map<string, number>>();
+  private activeSentinelDrifts = new Map<string, Set<string>>();
+  private sentinelLastProbe = new Map<string, number>();
   // Replica-slot-state (valkey#1664) state, same discipline as stuck-replica:
   // `firstSeen` gates on persistence so a transient reshard snapshot doesn't
   // alert, `active` dedupes once the gate has fired.
@@ -526,6 +591,17 @@ export class AnomalyService extends MultiConnectionPoller implements OnModuleIni
     this.activeHostnameStaleness.delete(connectionId);
     this.ghostMemberFirstSeen.delete(connectionId);
     this.activeGhostMembers.delete(connectionId);
+    this.ghostHistories.delete(connectionId);
+    this.clientLockoutState.delete(connectionId);
+    this.authFailureState.delete(connectionId);
+    this.authFailureLastScan.delete(connectionId);
+    this.aclSnapshot.delete(connectionId);
+    this.aclDriftRecheck.delete(connectionId);
+    this.aclUnverified.delete(connectionId);
+    this.aclDeniedUntil.delete(connectionId);
+    this.sentinelDriftFirstSeen.delete(connectionId);
+    this.activeSentinelDrifts.delete(connectionId);
+    this.sentinelLastProbe.delete(connectionId);
     this.replicaSlotFirstSeen.delete(connectionId);
     this.activeReplicaSlotAnomalies.delete(connectionId);
     this.replicaSlotEventIds.delete(connectionId);
@@ -1113,6 +1189,7 @@ export class AnomalyService extends MultiConnectionPoller implements OnModuleIni
           await this.detectStuckReplicas(ctx, timestamp, nodes);
           await this.detectHostnameStaleness(ctx, timestamp, nodes, shards);
           await this.detectGhostMembers(ctx, timestamp, nodes);
+          await this.detectForgetRejoin(ctx, timestamp, nodes);
           await this.detectFailoverChurn(ctx, timestamp, nodes);
           // Replica migrating/importing markers are node-local — only the
           // queried node's own line carries them — so aggregate each replica's
@@ -1150,6 +1227,29 @@ export class AnomalyService extends MultiConnectionPoller implements OnModuleIni
       // (valkey-io/valkey#3918): warns before the pool exhausts and operators
       // can no longer connect. State-based with hysteresis, not z-score.
       await this.detectClientSaturation(info, ctx, timestamp);
+
+      // Connection-exhaustion / admin-lockout risk (valkey-io/valkey#3944):
+      // sustained pressure on the maxclients ceiling, escalated the moment
+      // connections are actually being refused. Complements the saturation
+      // signal above by pairing utilization with live refusals.
+      await this.detectClientLockoutRisk(info, ctx, timestamp);
+
+      // Authentication-failure / brute-force attribution (valkey-io/valkey#334):
+      // repeated auth failures from ONE client address, which the aggregate
+      // ACL_DENIED counter cannot tell you. Reads the audit store rather than
+      // polling ACL LOG a second time.
+      await this.detectAuthFailureBurst(ctx, timestamp);
+
+      // Cross-node ACL drift + live-reload confirmation (valkey-io/valkey#4355):
+      // one node in a replication group serving a different ruleset than its
+      // peers, or a node whose ruleset changed. Same shared-snapshot shape as
+      // config drift — no fan-out, so a hung peer cannot stall this poll.
+      await this.detectAclDrift(info, ctx, timestamp);
+
+      // Sentinel endpoint drift (valkey-io/valkey#2158): a replica carried under
+      // an ephemeral pod IP where the group announces hostnames, or a node
+      // configured as a replica of itself. Sentinel deployments only.
+      await this.detectSentinelDrift(ctx, timestamp, info);
 
       // Cross-node config drift (valkey-io/valkey#1193): CONFIG SET only ever
       // applies to the single node it's sent to today, so nodes in the same
@@ -1286,6 +1386,688 @@ export class AnomalyService extends MultiConnectionPoller implements OnModuleIni
     // Advance the level last: on escalation only after addAnomaly resolved; on
     // steady/de-escalation immediately (the latter re-arms alerting on recovery).
     this.clientSaturationLevel.set(ctx.connectionId, level);
+  }
+
+  /**
+   * Connection-exhaustion / admin-lockout risk (valkey-io/valkey#3944). Distinct
+   * from the saturation signal above: this one requires the pressure to be
+   * SUSTAINED, and escalates to CRITICAL the moment `rejected_connections`
+   * actually moves — the difference between "headroom is nearly gone" and
+   * "connections, including yours, are being refused right now".
+   *
+   * Emits on escalation only; the detector owns the streak and hysteresis.
+   */
+  private async detectClientLockoutRisk(
+    info: Record<string, string>,
+    ctx: ConnectionContext,
+    timestamp: number,
+  ): Promise<void> {
+    let state = this.clientLockoutState.get(ctx.connectionId);
+    if (state === undefined) {
+      state = createClientLockoutState();
+      this.clientLockoutState.set(ctx.connectionId, state);
+    }
+
+    const finding = evaluateClientLockout(state, {
+      connectedClients: this.parseNumber(info.connected_clients),
+      maxClients: this.parseNumber(info.maxclients),
+      rejectedConnections: this.parseNumber(info.rejected_connections),
+      blockedClients: this.parseNumber(info.blocked_clients),
+    });
+    if (finding === null) {
+      return;
+    }
+
+    const event = this.buildClientLockoutEvent(ctx, timestamp, finding);
+    this.logger.warn(`Anomaly detected for ${ctx.connectionName}: ${event.message}`);
+    // Await the emit, then record the escalation. A failed emit leaves the
+    // hysteresis armed so the next poll retries instead of going quiet.
+    await this.addAnomaly(event, ctx);
+    // addAnomaly swallows a storage failure — it must not let one detector's write
+    // error abort the rest of the poll — so a rejected save returns normally with
+    // `persisted` unset. Committing on that path advanced the hysteresis for an
+    // advisory that only ever reached the in-memory ring, losing it on eviction or
+    // restart. `ctx.connectionId` is always set here, so a save was definitely
+    // attempted and `persisted !== true` means it failed: leave the level uncommitted
+    // and let the next poll try again.
+    if (event.persisted !== true) {
+      return;
+    }
+    commitClientLockoutLevel(state, finding.level);
+  }
+
+  private buildClientLockoutEvent(
+    ctx: ConnectionContext,
+    timestamp: number,
+    finding: ClientLockoutFinding,
+  ): AnomalyEvent {
+    const pct = finding.utilizationPct.toFixed(1);
+    const critical = finding.level === 'critical';
+    const blocked =
+      finding.blockedClients !== null && finding.blockedClients > 0
+        ? ` ${finding.blockedClients} client(s) are blocked, holding their slots.`
+        : '';
+    const trend = finding.rising ? ' The pool is still climbing.' : '';
+
+    // WARNING now has TWO distinct causes, and they need different copy. CRITICAL
+    // requires refusals AND sustained utilization, so a non-critical finding with
+    // refusals is the refusal-only case: utilization may be far below the ceiling
+    // and `streak` may be 0. Reusing the saturation headline there claimed the pool
+    // had held above the threshold for zero polls and never mentioned the refusals,
+    // giving the operator the wrong condition and the wrong remedy.
+    let headline: string;
+    if (critical) {
+      headline =
+        `CRITICAL: ${finding.connectedClients}/${finding.maxClients} clients (${pct}% of ` +
+        `maxclients) and ${finding.rejectedDelta} new connection(s) refused since the last ` +
+        `poll — the instance is turning connections away right now, including admin and ` +
+        `control-plane sessions.`;
+    } else if (finding.rejectedDelta > 0) {
+      headline =
+        `WARNING: ${finding.rejectedDelta} new connection(s) refused since the last poll, ` +
+        `with ${finding.connectedClients}/${finding.maxClients} clients connected (${pct}% of ` +
+        `maxclients). Clients were actually turned away, but utilization has not held at or ` +
+        `above ${LOCKOUT_UTILIZATION_PCT}% long enough to call this a lockout — check for a ` +
+        `connection burst or a client that opens more sockets than it closes. If the pressure ` +
+        `persists this escalates to CRITICAL.`;
+    } else {
+      headline =
+        `WARNING: Client connections have held at or above ${LOCKOUT_UTILIZATION_PCT}% of ` +
+        `maxclients for ${finding.streak} consecutive polls (now ${finding.connectedClients}/` +
+        `${finding.maxClients}, ${pct}%). Once the ceiling is reached, new connections — ` +
+        `including your own admin session — are refused, leaving the instance hard to inspect ` +
+        `or rescue.`;
+    }
+
+    return {
+      id: randomUUID(),
+      timestamp,
+      metricType: MetricType.CLIENT_LOCKOUT_RISK,
+      anomalyType: AnomalyType.SPIKE,
+      severity: critical ? AnomalySeverity.CRITICAL : AnomalySeverity.WARNING,
+      value: finding.connectedClients,
+      baseline: finding.maxClients,
+      zScore: 0,
+      stdDev: 0,
+      threshold: Math.floor((finding.maxClients * LOCKOUT_UTILIZATION_PCT) / 100),
+      message:
+        `${headline}${blocked}${trend} Raise \`maxclients\` (bounded by the OS \`ulimit -n\` and ` +
+        `\`maxmemory-clients\`), hunt the connection leak or storm behind the climb, or — where ` +
+        `available — reserve admin capacity with \`priority-net-sources\`/\`priority-maxclients\` ` +
+        `so the control plane keeps a way in.`,
+      resolved: false,
+      connectionId: ctx.connectionId,
+    };
+  }
+
+  /**
+   * How often the Sentinel view is probed. Each probe costs a `SENTINEL MASTERS`
+   * plus one `SENTINEL REPLICAS` per monitored master, and Sentinel topology
+   * changes on failover timescales, not per second.
+   */
+  private static readonly SENTINEL_PROBE_INTERVAL_MS = 15_000;
+
+  /**
+   * How long Sentinel endpoint drift must persist before it is alerted. Gossip
+   * and failover reconvergence legitimately shuffle recorded addresses for a
+   * short window and then settle; genuine drift does not.
+   */
+  private static readonly SENTINEL_DRIFT_MIN_PERSIST_MS = 60_000;
+
+  /**
+   * Sentinel endpoint drift (valkey-io/valkey#2158): Sentinel records a node's
+   * *resolved* address rather than its configured hostname, so in Kubernetes an
+   * ephemeral pod IP replaces the stable announced hostname — and once the pod is
+   * rescheduled, Sentinel and every client it steers point at a dead address. The
+   * same issue also reports a node ending up as a replica of itself.
+   *
+   * Sentinel deployments only, so a cluster or plain standalone connection never
+   * issues a SENTINEL command. The mode field is spelled differently per engine:
+   * Valkey emits `server_mode` unless `extended-redis-compat` is on, in which case
+   * it emits `redis_mode`; Redis emits `redis_mode`. Gating on `redis_mode` alone
+   * left the detector silent on any default-configured Valkey Sentinel.
+   */
+  private async detectSentinelDrift(
+    ctx: ConnectionContext,
+    timestamp: number,
+    info: Record<string, string>,
+  ): Promise<void> {
+    if (isSentinelMode(info) === false) {
+      return;
+    }
+
+    const lastProbe = this.sentinelLastProbe.get(ctx.connectionId);
+    if (
+      lastProbe !== undefined &&
+      timestamp - lastProbe < AnomalyService.SENTINEL_PROBE_INTERVAL_MS
+    ) {
+      return;
+    }
+    this.sentinelLastProbe.set(ctx.connectionId, timestamp);
+
+    try {
+      const masters = await ctx.client.getSentinelMasters();
+      const findings: SentinelDrift[] = [];
+      const unreadMasters = new Set<string>();
+      for (const master of masters) {
+        // A per-master failure (the master was just removed, or Sentinel is
+        // mid-failover) skips that master rather than losing the whole view.
+        try {
+          const replicas = await ctx.client.getSentinelReplicas(master.name);
+          findings.push(...detectSentinelDrift(master, replicas));
+        } catch (replicaErr) {
+          unreadMasters.add(master.name);
+          this.logger.debug(
+            `Failed to read Sentinel replicas for ${master.name} on ${ctx.connectionName}: ${replicaErr instanceof Error ? replicaErr.message : replicaErr}`,
+          );
+        }
+      }
+
+      await this.applyTopologyPersistenceGate({
+        ctx,
+        timestamp,
+        findings,
+        signatureOf: sentinelDriftSignature,
+        firstSeenByConn: this.sentinelDriftFirstSeen,
+        activeByConn: this.activeSentinelDrifts,
+        minPersistMs: AnomalyService.SENTINEL_DRIFT_MIN_PERSIST_MS,
+        // Skipping a master is an observation GAP, not recovery. Without this the
+        // gate would read its absent findings as resolved, clear their grace
+        // window and drop them from `active` — so an intermittent replica-read
+        // error during a failover could restart the 60s clock indefinitely, or
+        // re-emit a finding that had already alerted. On a single-master Sentinel
+        // one failed read empties the view entirely.
+        preserveSignature: (signature) => {
+          return unreadMasters.has(sentinelDriftSignatureMaster(signature));
+        },
+        buildEvent: (drift) => {
+          return this.buildSentinelDriftEvent(ctx, timestamp, drift);
+        },
+      });
+    } catch (sentinelErr) {
+      this.logger.debug(
+        `Failed to check Sentinel topology for ${ctx.connectionName}: ${sentinelErr instanceof Error ? sentinelErr.message : sentinelErr}`,
+      );
+    }
+  }
+
+  private buildSentinelDriftEvent(
+    ctx: ConnectionContext,
+    timestamp: number,
+    drift: SentinelDrift,
+  ): AnomalyEvent {
+    if (drift.reason === 'stale_master_pointer') {
+      return {
+        id: randomUUID(),
+        timestamp,
+        metricType: MetricType.SENTINEL_ENDPOINT_DRIFT,
+        anomalyType: AnomalyType.SPIKE,
+        severity: AnomalySeverity.WARNING,
+        value: 1,
+        baseline: 0,
+        zScore: 0,
+        stdDev: 0,
+        threshold: 0,
+        message:
+          `WARNING: Sentinel has replica ${drift.nodeName} of monitored master ` +
+          `'${drift.masterName}' pointed at the raw address ${drift.endpoint}, while the group ` +
+          `is otherwise announced by hostname (e.g. ${drift.expectedStyle}). That address is what ` +
+          `a REPLICAOF is aimed at, so once the primary's pod or host is rescheduled the replica ` +
+          `follows a dead endpoint and silently stops replicating (valkey#2158). Announce the ` +
+          `primary by hostname consistently and reconcile the Sentinel config.`,
+        resolved: false,
+        connectionId: ctx.connectionId,
+      };
+    }
+
+    const message =
+      drift.reason === 'self_replication'
+        ? `CRITICAL: Sentinel has ${drift.nodeName} (monitored master '${drift.masterName}') ` +
+          `configured as a replica of itself at ${drift.endpoint}. It can never receive data ` +
+          `from a real primary, so it silently serves a frozen dataset and is a broken failover ` +
+          `target (valkey#2158). Re-point it with REPLICAOF at the real primary and reconcile ` +
+          `the Sentinel config.`
+        : `WARNING: Sentinel records ${drift.role} ${drift.nodeName} of monitored master ` +
+          `'${drift.masterName}' under the raw address ${drift.endpoint}, while the rest of the ` +
+          `group is announced by hostname (e.g. ${drift.expectedStyle}). Sentinel stores the ` +
+          `resolved address rather than the configured hostname (valkey#2158), so this entry ` +
+          `goes stale the moment the pod or host is rescheduled — clients and failover would ` +
+          `then be steered at a dead address. Set \`replica-announce-ip\` (or enable hostname ` +
+          `announcement) consistently across the group and reconcile the Sentinel config.`;
+
+    return {
+      id: randomUUID(),
+      timestamp,
+      metricType: MetricType.SENTINEL_ENDPOINT_DRIFT,
+      anomalyType: AnomalyType.SPIKE,
+      severity:
+        drift.reason === 'self_replication' ? AnomalySeverity.CRITICAL : AnomalySeverity.WARNING,
+      value: 1,
+      baseline: 0,
+      zScore: 0,
+      stdDev: 0,
+      threshold: 0,
+      message,
+      resolved: false,
+      connectionId: ctx.connectionId,
+    };
+  }
+
+  /**
+   * Polls between `ACL LIST` reads. ACLs change only when an operator (or their
+   * controller) changes them, so re-reading every poll would spend a command per
+   * second on a signal that moves on a scale of days. Drift is still EVALUATED
+   * every poll — only the fetch is throttled.
+   */
+  private static readonly ACL_DRIFT_RECHECK_POLLS = 60;
+
+  /**
+   * How long a denied `ACL LIST` is left alone before retrying. Missing `+acl`
+   * on the monitoring user is a configuration decision, so retrying on the poll
+   * cadence would hammer the server and pollute its own ACL LOG for nothing.
+   */
+  private static readonly ACL_DENIED_BACKOFF_MS = 5 * 60_000;
+
+  /**
+   * Whether an `ACL LIST` failure is a permissions/support problem rather than a
+   * transient one. Only these earn the long backoff: they will not resolve on
+   * their own, whereas a LOADING or timeout will.
+   */
+  private static isAclPermissionError(message: string): boolean {
+    const normalized = message.toUpperCase();
+    return (
+      normalized.includes('NOPERM') ||
+      normalized.includes('WRONGPASS') ||
+      normalized.includes('NOAUTH') ||
+      normalized.includes('UNKNOWN COMMAND') ||
+      normalized.includes('UNKNOWN SUBCOMMAND')
+    );
+  }
+
+  /**
+   * Reads this connection's ACL fingerprint into `aclSnapshot`, on the same slow
+   * recheck countdown as the config snapshot. Returns the previous digest when
+   * the ruleset changed this poll, so the caller can confirm a reload.
+   *
+   * A denied or failed `ACL LIST` DROPS this connection's slice. Keeping a stale
+   * slice would be worse than useless: the group would be reported as consistent
+   * on the strength of a reading we can no longer take. The node simply stops
+   * participating in the comparison until the read succeeds again.
+   *
+   * A denial also opens a backoff window. The monitoring user lacking `+acl` is a
+   * permanent misconfiguration, not a transient error, and without the window
+   * every poll would re-issue a NOPERM `ACL LIST` — once a second by default.
+   * Each denial writes an ACL LOG entry and bumps `acl_access_denied_cmd`, which
+   * this very service then reports as ACL denials: a monitor manufacturing the
+   * anomalies it alerts on.
+   */
+  private async refreshAclSnapshot(
+    ctx: ConnectionContext,
+    replid: string,
+    timestamp: number,
+  ): Promise<{ previousDigest: string | null } | null> {
+    const deniedUntil = this.aclDeniedUntil.get(ctx.connectionId);
+    if (deniedUntil !== undefined && timestamp < deniedUntil) {
+      return null;
+    }
+
+    const groupKey = `replid:${replid}`;
+    const cached = this.aclSnapshot.get(ctx.connectionId);
+    const countdown = this.aclDriftRecheck.get(ctx.connectionId) ?? 0;
+    const cacheUsable = cached !== undefined && cached.groupKey === groupKey;
+
+    if (cacheUsable && countdown > 0) {
+      this.aclDriftRecheck.set(ctx.connectionId, countdown - 1);
+      return { previousDigest: null };
+    }
+
+    let aclList: string[];
+    try {
+      aclList = await ctx.client.getAclList();
+    } catch (aclErr) {
+      const message = aclErr instanceof Error ? aclErr.message : String(aclErr);
+
+      // A transient failure (LOADING during a failover, a timeout) says nothing
+      // about our permissions. Keep the last-known slice and retry on the normal
+      // cadence, as refreshConfigSnapshot does — dropping it would clear active
+      // drift and re-alert it as new once the node came back.
+      if (!AnomalyService.isAclPermissionError(message)) {
+        this.logger.debug(`ACL LIST failed for ${ctx.connectionName}: ${message}`);
+        return null;
+      }
+
+      // No ACL read permission: the consistency check cannot run for this node.
+      // Say so once rather than failing the poll or, worse, silently reporting a
+      // group as consistent that we cannot see.
+      if (!this.aclUnverified.has(ctx.connectionId)) {
+        this.aclUnverified.add(ctx.connectionId);
+        this.logger.warn(
+          `ACL drift check unverified for ${ctx.connectionName}: ${message}. ` +
+            `Grant the monitoring user permission to run ACL LIST to enable ACL consistency checks.`,
+        );
+      }
+      this.aclSnapshot.delete(ctx.connectionId);
+      this.aclDeniedUntil.set(ctx.connectionId, timestamp + AnomalyService.ACL_DENIED_BACKOFF_MS);
+      return null;
+    }
+
+    this.aclUnverified.delete(ctx.connectionId);
+    this.aclDeniedUntil.delete(ctx.connectionId);
+
+    const { digest, userDigests } = nodeAclDigest(aclList);
+    const previousDigest = cacheUsable && cached.digest !== digest ? cached.digest : null;
+
+    this.aclSnapshot.set(ctx.connectionId, {
+      groupKey,
+      name: ctx.connectionName,
+      digest,
+      userDigests,
+    });
+    this.aclDriftRecheck.set(ctx.connectionId, AnomalyService.ACL_DRIFT_RECHECK_POLLS);
+    return { previousDigest };
+  }
+
+  /**
+   * ACL drift and live-reload confirmation (valkey-io/valkey#4355).
+   *
+   * Two findings share one metric because they answer the same operator
+   * question — "is this node serving the ruleset I think it is?":
+   *
+   *  - **Cross-node drift** (WARNING): nodes in one replication group disagree.
+   *    One node is enforcing different authorization than its peers, which shows
+   *    up as auth failures the moment a failover moves traffic to it.
+   *  - **Reload confirmation** (INFO): a single node's digest changed. Expected
+   *    right after an `ACL LOAD`; unexplained otherwise, and worth a look.
+   *
+   * Built the same "shared snapshot" way as config drift: no live fan-out to
+   * sibling nodes, so a hung peer can never stall this poll.
+   */
+  private async detectAclDrift(
+    info: Record<string, string>,
+    ctx: ConnectionContext,
+    timestamp: number,
+  ): Promise<void> {
+    try {
+      const replid = info['master_replid'];
+      const roleStr = info['role'];
+      const isReplicating = roleStr === 'master' || roleStr === 'slave' || roleStr === 'replica';
+
+      if (!replid || !isReplicating) {
+        this.aclSnapshot.delete(ctx.connectionId);
+      } else {
+        const refreshed = await this.refreshAclSnapshot(ctx, replid, timestamp);
+        if (refreshed?.previousDigest) {
+          await this.addAnomaly(
+            this.buildAclReloadEvent(ctx, timestamp, refreshed.previousDigest),
+            ctx,
+          );
+        }
+      }
+
+      const nodes: AclDriftNode[] = Array.from(this.aclSnapshot.entries()).map(
+        ([connectionId, snap]) => {
+          return {
+            connectionId,
+            name: snap.name,
+            groupKey: snap.groupKey,
+            digest: snap.digest,
+            userDigests: snap.userDigests,
+          };
+        },
+      );
+      const drifts = detectAclDrift(nodes);
+      const currentSignatures = new Set(drifts.map(aclDriftSignature));
+
+      // Reconciled SYNCHRONOUSLY (no await inside) for the same reason as config
+      // drift: this runs from EVERY connection's poll, those polls run
+      // concurrently, and they share activeAclDriftSignatures.
+      const newDrifts: AclDrift[] = [];
+      for (const drift of drifts) {
+        const signature = aclDriftSignature(drift);
+        if (this.activeAclDriftSignatures.has(signature)) {
+          continue;
+        }
+        this.activeAclDriftSignatures.add(signature);
+        newDrifts.push(drift);
+      }
+      for (const signature of this.activeAclDriftSignatures) {
+        if (!currentSignatures.has(signature)) {
+          this.activeAclDriftSignatures.delete(signature);
+        }
+      }
+
+      // The signature is CLAIMED synchronously above so concurrent polls cannot both
+      // emit the same drift, but the claim is only kept if the emit succeeds. A
+      // throw here would otherwise leave the signature marked active and silently
+      // suppress the drift until it clears and recurs — unacceptable for a security
+      // alert. Releasing the claim on failure lets the next poll retry it.
+      for (const drift of newDrifts) {
+        const event = this.buildAclDriftEvent(timestamp, drift);
+        this.logger.warn(`Anomaly detected: ${event.message}`);
+        // Attributed to the first node of the group, which is frequently NOT the
+        // connection whose poll ran this scan.
+        const attributedCtx = this.buildConnectionContext(drift.nodes[0].connectionId);
+        // Release and CONTINUE, not release and re-throw. Re-throwing abandoned the
+        // rest of the batch, leaving those drifts holding the claim they took in the
+        // reconcile step without ever emitting — the original bug, narrowed to the
+        // tail of a multi-drift poll. Each finding gets its own attempt.
+        //
+        // The release has to key off `persisted`, not off a rejection. addAnomaly
+        // CATCHES storage failures so one detector's write error cannot abort the
+        // rest of the poll, which means the real failure mode resolves normally with
+        // `persisted` unset — a rejection-only release would never fire for it and
+        // the drift would stay suppressed until it cleared and recurred. The catch
+        // is kept for a throw from anywhere else in the emit path.
+        let emitFailure: string | null = null;
+        try {
+          await this.addAnomaly(event, attributedCtx);
+          if (event.persisted !== true) {
+            emitFailure = 'anomaly was not persisted';
+          }
+        } catch (emitErr) {
+          emitFailure = emitErr instanceof Error ? emitErr.message : String(emitErr);
+        }
+        if (emitFailure !== null) {
+          this.activeAclDriftSignatures.delete(aclDriftSignature(drift));
+          this.logger.debug(`ACL drift emit failed, released for retry: ${emitFailure}`);
+        }
+      }
+    } catch (err) {
+      this.logger.debug(
+        `Failed to check ACL drift for ${ctx.connectionName}: ${err instanceof Error ? err.message : err}`,
+      );
+    }
+  }
+
+  /**
+   * Cross-node ACL disagreement. Carries usernames and digests only — never rule
+   * bodies, which would put key patterns and password hashes into the anomaly
+   * store and webhook payloads.
+   */
+  private buildAclDriftEvent(timestamp: number, drift: AclDrift): AnomalyEvent {
+    const nodeLabel = drift.nodes
+      .map((node) => {
+        return `${node.name ?? node.connectionId} = ${node.digest}`;
+      })
+      .join(', ');
+    const userLabel =
+      drift.usernames.length > 0 ? drift.usernames.join(', ') : 'no individually-named user';
+
+    return {
+      id: randomUUID(),
+      timestamp,
+      metricType: MetricType.ACL_DRIFT,
+      anomalyType: AnomalyType.SPIKE,
+      severity: AnomalySeverity.WARNING,
+      value: drift.nodes.length,
+      baseline: 1,
+      zScore: 0,
+      stdDev: 0,
+      threshold: 1,
+      message:
+        `WARNING: Nodes in the same replication group are serving different ACL rulesets ` +
+        `(${nodeLabel}). Users that differ: ${userLabel}. An ACL LOAD or CONFIG-managed push ` +
+        `applies per node, so one node can quietly keep an older ruleset (valkey#4355) — the ` +
+        `divergence only surfaces as auth failures once a failover moves traffic to it. ` +
+        `Re-run \`ACL LOAD\` on the lagging node, or reconcile its ACL file, then confirm the ` +
+        `digests match.`,
+      resolved: false,
+      connectionId: drift.nodes[0].connectionId,
+    };
+  }
+
+  /** Single-node ACL revision change — the reload-confirmation half of #4355. */
+  private buildAclReloadEvent(
+    ctx: ConnectionContext,
+    timestamp: number,
+    previousDigest: string,
+  ): AnomalyEvent {
+    const current = this.aclSnapshot.get(ctx.connectionId)?.digest ?? 'unknown';
+    return {
+      id: randomUUID(),
+      timestamp,
+      metricType: MetricType.ACL_DRIFT,
+      anomalyType: AnomalyType.SPIKE,
+      severity: AnomalySeverity.INFO,
+      value: 1,
+      baseline: 0,
+      zScore: 0,
+      stdDev: 0,
+      threshold: 0,
+      message:
+        `INFO: The ACL ruleset on this node changed (digest ${previousDigest} → ${current}). ` +
+        `Expected right after an ACL LOAD or an ACL SETUSER; if nobody pushed a change, the ` +
+        `node adopted a ruleset you did not intend. Compare the digest against the group's ` +
+        `other nodes to confirm the whole group converged.`,
+      resolved: false,
+      connectionId: ctx.connectionId,
+    };
+  }
+
+  /**
+   * How often the audit store is scanned for an auth-failure burst. The poll
+   * loop runs at ANOMALY_POLL_INTERVAL_MS (1s by default), which would mean a
+   * storage query per second for a signal whose window is minutes wide.
+   */
+  private static readonly AUTH_FAILURE_SCAN_INTERVAL_MS = 30_000;
+
+  /**
+   * Authentication-failure / brute-force advisory (valkey-io/valkey#334):
+   * repeated failed AUTHs from ONE client address, which the aggregate
+   * `acl_access_denied_auth` counter cannot attribute.
+   *
+   * The source is the audit store, not a fresh `ACL LOG` call — `AuditService`
+   * already polls, dedupes and persists that log every cycle, and reading its
+   * output means this advisory inherits the capability gating, the ring-buffer
+   * handling and the `ACL LOG RESET` tolerance already built there.
+   */
+  private async detectAuthFailureBurst(ctx: ConnectionContext, timestamp: number): Promise<void> {
+    const lastScan = this.authFailureLastScan.get(ctx.connectionId);
+    if (
+      lastScan !== undefined &&
+      timestamp - lastScan < AnomalyService.AUTH_FAILURE_SCAN_INTERVAL_MS
+    ) {
+      return;
+    }
+    this.authFailureLastScan.set(ctx.connectionId, timestamp);
+
+    try {
+      // No time filter on the query. `captured_at` records when the poller last
+      // SAVED a row, and the upsert refreshes it on every save, so it tracks the
+      // last time we observed the entry — NOT when the failures happened. The
+      // server reports each ACL LOG entry's own age separately, and a restart or a
+      // newly-added connection stamps every entry currently in the ring with the
+      // current time, backfilling hours-old failures as if they were fresh.
+      // Filtering on `captured_at` would therefore select on poller behaviour
+      // rather than on attack activity. The detector windows on observed growth
+      // instead, which is the only signal that reflects real in-window failures.
+      //
+      // That refresh is also what makes AUTH_FAILURE_QUERY_LIMIT safe: the store
+      // orders by `captured_at DESC`, so entries still being written stay at the
+      // top of the result set and an entry under active attack cannot be pushed
+      // past the ceiling by a backlog of dormant ones.
+      const entries = await this.storage.getAclEntries({
+        connectionId: ctx.connectionId,
+        limit: AUTH_FAILURE_QUERY_LIMIT,
+      });
+      let state = this.authFailureState.get(ctx.connectionId);
+      if (state === undefined) {
+        state = createAuthFailureState();
+        this.authFailureState.set(ctx.connectionId, state);
+      }
+
+      const sources = observeAuthFailures(
+        state,
+        entries,
+        timestamp,
+        AUTH_FAILURE_WINDOW_MS,
+        AUTH_FAILURE_MIN_COUNT,
+      );
+      for (const source of takeAlertable(state, sources, timestamp)) {
+        const event = this.buildAuthFailureEvent(ctx, timestamp, source);
+        this.logger.warn(`Anomaly detected for ${ctx.connectionName}: ${event.message}`);
+        await this.addAnomaly(event, ctx);
+      }
+    } catch (authErr) {
+      this.logger.debug(
+        `Failed to scan auth failures for ${ctx.connectionName}: ${authErr instanceof Error ? authErr.message : authErr}`,
+      );
+    }
+  }
+
+  /**
+   * Builds the auth-failure event. Deliberately carries only the client address,
+   * usernames, counts and reason breakdown — never the `object` field or the raw
+   * `client-info`, which would push key names and command arguments into the
+   * anomaly store and out through webhook payloads.
+   */
+  private buildAuthFailureEvent(
+    ctx: ConnectionContext,
+    timestamp: number,
+    source: AuthFailureSource,
+  ): AnomalyEvent {
+    const windowMinutes = Math.round(AUTH_FAILURE_WINDOW_MS / 60_000);
+    const users = source.usernames.slice(0, 5).join(', ');
+    const moreUsers = source.usernames.length > 5 ? `, +${source.usernames.length - 5} more` : '';
+    const otherReasons = Object.entries(source.reasonBreakdown)
+      .filter(([reason]) => {
+        return reason !== 'auth';
+      })
+      .map(([reason, count]) => {
+        return `${reason}=${count}`;
+      });
+    const alsoDenied =
+      otherReasons.length > 0
+        ? ` The same address also hit other ACL denials (${otherReasons.join(', ')}), so it is ` +
+          `probing beyond the login itself.`
+        : '';
+    const usernameNote =
+      source.usernames.length > 1
+        ? ` across ${source.usernames.length} usernames (${users}${moreUsers}) — credential guessing rather than one stale client`
+        : ` against user '${users}'`;
+
+    return {
+      id: randomUUID(),
+      timestamp,
+      metricType: MetricType.AUTH_FAILURE_BURST,
+      anomalyType: AnomalyType.SPIKE,
+      severity: AnomalySeverity.WARNING,
+      value: source.authFailures,
+      baseline: 0,
+      zScore: 0,
+      stdDev: 0,
+      threshold: AUTH_FAILURE_MIN_COUNT,
+      message:
+        `WARNING: ${source.authFailures} authentication failures recorded against ` +
+        `${source.clientAddress} in the last ${windowMinutes} minutes${usernameNote}.${alsoDenied} ` +
+        `ACL LOG groups failures by user and reason rather than by client, so treat the address as ` +
+        `the client recorded on those failures. Identify the client behind ` +
+        `that address; if it is not yours, restrict reachability (\`bind\`, firewall, security ` +
+        `group) before anything else, and rotate any credential it may have guessed. If it IS ` +
+        `yours, it is running with stale credentials and will keep retrying.`,
+      resolved: false,
+      connectionId: ctx.connectionId,
+    };
   }
 
   /**
@@ -3196,12 +3978,14 @@ export class AnomalyService extends MultiConnectionPoller implements OnModuleIni
   private static readonly GHOST_MEMBER_MIN_PERSIST_MS = 30_000;
 
   /**
-   * Detects a ghost cluster member (valkey-io/valkey#1757) from this connection's
-   * `CLUSTER NODES` view: an endpoint claimed by a stale (`fail`/`fail?`/`noaddr`)
-   * node-id that peers never forgot after a `CLUSTER RESET`/restart, alongside the
-   * live id that now occupies it. Emits a WARNING once the ghost has persisted
-   * past the re-MEET grace window, dedupes per (endpoint, ids) signature, and
-   * clears state on recovery so a re-appearing ghost alerts again.
+   * Detects endpoint-identity faults from this connection's `CLUSTER NODES` view:
+   * a stale (`fail`/`fail?`/`noaddr`) node-id peers never forgot after a
+   * `CLUSTER RESET`/restart alongside the live id that now occupies its endpoint
+   * (valkey-io/valkey#1757), two established ids claiming one endpoint, and a node
+   * whose address flipped to loopback while its peers stayed routable
+   * (valkey-io/valkey#2768). Emits once a finding has persisted past the re-MEET
+   * grace window, dedupes per (reason, endpoint, ids) signature, and clears state
+   * on recovery so a re-appearing fault alerts again.
    */
   private async detectGhostMembers(
     ctx: ConnectionContext,
@@ -3218,27 +4002,19 @@ export class AnomalyService extends MultiConnectionPoller implements OnModuleIni
         activeByConn: this.activeGhostMembers,
         minPersistMs: AnomalyService.GHOST_MEMBER_MIN_PERSIST_MS,
         buildEvent: (g, signature) => {
-          const ghostLabel = g.ghostIds.map((id) => id.substring(0, 8)).join(', ');
-          const forgetCmds = g.ghostIds.map((id) => `CLUSTER FORGET ${id}`).join('; ');
-          const plural = g.ghostIds.length > 1;
+          const { severity, value, message } = this.describeGhostFinding(g);
           return {
-            id: `${ctx.connectionId}-ghost-member-${signature}-${timestamp}`,
+            id: randomUUID(),
             timestamp,
             metricType: MetricType.GHOST_MEMBERSHIP,
             anomalyType: AnomalyType.SPIKE,
-            severity: AnomalySeverity.WARNING,
-            value: g.ghostIds.length,
+            severity,
+            value,
             baseline: 0,
             zScore: 0,
             stdDev: 0,
             threshold: 0,
-            message:
-              `WARNING: Endpoint ${g.endpoint} is now node ${g.liveId.substring(0, 8)}, but ` +
-              `stale node-id${plural ? 's' : ''} ${ghostLabel} still linger${plural ? '' : 's'} in the ` +
-              `cluster view. A CLUSTER RESET/restart does not make peers forget a node (valkey#1757), ` +
-              `so the old identity keeps re-joining and causing errors. Run \`${forgetCmds}\` on every ` +
-              `other node in the cluster — primaries AND replicas — to fully evict the ghost; any node ` +
-              `that still remembers it re-gossips it back after the 60s FORGET ban expires.`,
+            message,
             resolved: false,
             connectionId: ctx.connectionId,
           };
@@ -3249,6 +4025,161 @@ export class AnomalyService extends MultiConnectionPoller implements OnModuleIni
         `Failed to check ghost membership for ${ctx.connectionName}: ${ghostErr instanceof Error ? ghostErr.message : ghostErr}`,
       );
     }
+  }
+
+  /**
+   * Severity, magnitude and operator advice for one endpoint-identity finding.
+   * The three reasons share a metric but not a remedy: a stale twin is cleared
+   * with `CLUSTER FORGET`, while the live-twin cases need the mis-announcing node
+   * fixed — forgetting a live id would only evict a healthy node.
+   */
+  private describeGhostFinding(g: GhostMember): {
+    severity: AnomalySeverity;
+    value: number;
+    message: string;
+  } {
+    const shortIds = (ids: string[]): string => {
+      return ids
+        .map((id) => {
+          return id.substring(0, 8);
+        })
+        .join(', ');
+    };
+
+    const selfReplicationNote =
+      g.selfReplicatingIds.length > 0
+        ? ` Node ${shortIds(g.selfReplicatingIds)} is currently configured as a replica of ` +
+          `itself, which confirms the endpoint is being resolved to the wrong node.`
+        : '';
+
+    if (g.reason === 'loopback_flip') {
+      const alsoColliding =
+        g.collidingIds.length > 1
+          ? ` The endpoint is shared by ${g.collidingIds.length} live ids (${shortIds(g.collidingIds)}).`
+          : '';
+      return {
+        severity: AnomalySeverity.CRITICAL,
+        value: g.collidingIds.length,
+        message:
+          `CRITICAL: Node ${g.liveId.substring(0, 8)} advertises the loopback endpoint ` +
+          `${g.endpoint} while its peers use routable addresses. Its address discovery picked ` +
+          `up the wrong interface (valkey#2768), so peers and clients cannot reach it, and ` +
+          `failover cannot select it correctly.${alsoColliding}${selfReplicationNote} Set ` +
+          `\`cluster-announce-ip\` to the node's routable address and restart it, then check the ` +
+          `host for CPU steal — scheduling starvation is the usual trigger.`,
+      };
+    }
+
+    if (g.reason === 'live_endpoint_collision') {
+      return {
+        severity:
+          g.selfReplicatingIds.length > 0 ? AnomalySeverity.CRITICAL : AnomalySeverity.WARNING,
+        value: g.collidingIds.length,
+        message:
+          `${g.selfReplicatingIds.length > 0 ? 'CRITICAL' : 'WARNING'}: Endpoint ${g.endpoint} is ` +
+          `claimed by ${g.collidingIds.length} live cluster nodes (${shortIds(g.collidingIds)}). ` +
+          `Two live nodes advertising one address (valkey#2768) breaks failover target selection, ` +
+          `can make a replica PSYNC to itself, and routes clients to the wrong ` +
+          `node.${selfReplicationNote} Do NOT run CLUSTER FORGET here — both ids are live. Check ` +
+          `the affected hosts for CPU steal, pin each node's address with \`cluster-announce-ip\`, ` +
+          `and restart the node that mis-discovered its address.`,
+      };
+    }
+
+    const plural = g.ghostIds.length > 1;
+    const forgetCmds = g.ghostIds
+      .map((id) => {
+        return `CLUSTER FORGET ${id}`;
+      })
+      .join('; ');
+    return {
+      severity: AnomalySeverity.WARNING,
+      value: g.ghostIds.length,
+      message:
+        `WARNING: Endpoint ${g.endpoint} is now node ${g.liveId.substring(0, 8)}, but ` +
+        `stale node-id${plural ? 's' : ''} ${shortIds(g.ghostIds)} still linger${plural ? '' : 's'} in the ` +
+        `cluster view. A CLUSTER RESET/restart does not make peers forget a node (valkey#1757), ` +
+        `so the old identity keeps re-joining and causing errors. Run \`${forgetCmds}\` on every ` +
+        `other node in the cluster — primaries AND replicas — to fully evict the ghost; any node ` +
+        `that still remembers it re-gossips it back after the 60s FORGET ban expires.`,
+    };
+  }
+
+  /**
+   * Known false positive: an INTENTIONAL re-add of the same node-id — a host that
+   * kept its `nodes.conf` and was brought back without a `CLUSTER RESET`, inside
+   * the 6h retention window — is indistinguishable from a self-reintroduction and
+   * alerts as one. Re-add-with-reset is correctly silent, since the id changes.
+   * The advisory copy says so, and the operator is the only one who knows intent.
+   *
+   * Ghost-membership Layer 2 (valkey-io/valkey#2788): a node the operator removed
+   * with `CLUSTER FORGET` that reintroduced itself once the ~60s blacklist window
+   * lapsed, because some peer never got the FORGET and kept gossiping it.
+   *
+   * Invisible in any single `CLUSTER NODES` snapshot — the returned node just
+   * looks like a member — so this reads the per-connection membership history
+   * instead. Fires on the departed→present transition, which is inherently once
+   * per rejoin, so it needs no dedupe set of its own; the history's minimum
+   * absence requirement is the noise gate.
+   */
+  private async detectForgetRejoin(
+    ctx: ConnectionContext,
+    timestamp: number,
+    nodes: ClusterNode[],
+  ): Promise<void> {
+    try {
+      let history = this.ghostHistories.get(ctx.connectionId);
+      if (history === undefined) {
+        history = new GhostMembershipHistory();
+        this.ghostHistories.set(ctx.connectionId, history);
+      }
+
+      for (const rejoin of history.observe(nodes, timestamp)) {
+        const event = this.buildForgetRejoinEvent(ctx, timestamp, rejoin);
+        this.logger.warn(`Anomaly detected for ${ctx.connectionName}: ${event.message}`);
+        await this.addAnomaly(event, ctx);
+      }
+    } catch (rejoinErr) {
+      this.logger.debug(
+        `Failed to check forget-rejoin history for ${ctx.connectionName}: ${rejoinErr instanceof Error ? rejoinErr.message : rejoinErr}`,
+      );
+    }
+  }
+
+  private buildForgetRejoinEvent(
+    ctx: ConnectionContext,
+    timestamp: number,
+    rejoin: ForgetRejoin,
+  ): AnomalyEvent {
+    const absentSeconds = Math.max(0, Math.round((rejoin.returnedAt - rejoin.departedAt) / 1000));
+    const absence =
+      absentSeconds >= 120 ? `${Math.round(absentSeconds / 60)}m` : `${absentSeconds}s`;
+    const stillJoining = rejoin.flags.includes('handshake') ? ' (still handshaking)' : '';
+
+    return {
+      id: randomUUID(),
+      timestamp,
+      metricType: MetricType.GHOST_MEMBERSHIP,
+      anomalyType: AnomalyType.SPIKE,
+      severity: AnomalySeverity.WARNING,
+      value: rejoin.absentPolls,
+      baseline: 0,
+      zScore: 0,
+      stdDev: 0,
+      threshold: 0,
+      message:
+        `WARNING: Node ${rejoin.nodeId.substring(0, 8)} reintroduced itself at ` +
+        `${rejoin.endpoint}${stillJoining} after ${absence} away from the cluster view. ` +
+        `CLUSTER FORGET only blacklists a node-id for about 60s (valkey#2788) — any peer that ` +
+        `was not also given the FORGET keeps gossiping the removed node and re-adds it once the ` +
+        `ban lapses, so a scale-down silently undoes itself. Run ` +
+        `\`CLUSTER FORGET ${rejoin.nodeId}\` on EVERY remaining node — primaries AND replicas — ` +
+        `inside that window, and verify the node is gone from each node's view before ` +
+        `decommissioning the host. If you deliberately re-added this node, disregard this ` +
+        `advisory: a re-add that reuses the same node-id is indistinguishable from a rejoin.`,
+      resolved: false,
+      connectionId: ctx.connectionId,
+    };
   }
 
   /**

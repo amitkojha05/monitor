@@ -38,6 +38,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -129,6 +131,8 @@ jobs:
   verify:
     needs: publish-npm
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     if: ${{ !inputs.skip_npm }}
 
     steps:
@@ -151,3 +155,13 @@ jobs:
           done
           echo "Package not available after 5 attempts"
           exit 1
+
+  publish-facade:
+    needs: [publish-npm, verify]
+    if: ${{ !inputs.skip_npm }}
+    permissions:
+      contents: write
+      id-token: write
+    uses: ./.github/workflows/ai-facade-release.yml
+    secrets:
+      NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
